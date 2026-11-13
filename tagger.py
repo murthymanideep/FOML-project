@@ -30,8 +30,15 @@ class Tagger:
             self.tag_number[tag_names[k]] = k
         self.model = AveragedPerceptron(len(tag_names), n_rows)
 
-    def get_features(self, words, normal_words, i, previous_tag, previous_tag_2):
-        """Features for the word at position i (positions start at 1)."""
+    def get_features(self, words, normal_words, i, previous_tag, previous_tag_2, first_tags=None):
+        """
+        Features for the word at position i (positions start at 1).
+
+        first_tags is only used by the SECOND-PASS tagger: it holds the tags
+        that a first tagger already guessed for the whole sentence. With them
+        the second tagger can also look at the (guessed) tags of the words to
+        the RIGHT, which a left-to-right tagger normally cannot see.
+        """
         n = len(words) - 1
         word = words[i]
         normal = normal_words[i]
@@ -79,9 +86,43 @@ class Tagger:
         features.append("w+1+w+2=" + next_word + "+" + next_word_2)
         features.append("t-1+w+1=" + previous_tag + "+" + next_word)
         features.append("position=" + str(min(i, 4)) + "+" + str(min(n - i, 4)))
+
+        if first_tags is not None:
+            p0 = first_tags[i]
+            if i - 1 >= 1:
+                p_left = first_tags[i - 1]
+            else:
+                p_left = START
+            if i + 1 <= n:
+                p_right = first_tags[i + 1]
+            else:
+                p_right = END
+            if i + 2 <= n:
+                p_right_2 = first_tags[i + 2]
+            else:
+                p_right_2 = END
+            if i + 3 <= n:
+                p_right_3 = first_tags[i + 3]
+            else:
+                p_right_3 = END
+            features.append("p=" + p0)
+            features.append("p-1=" + p_left)
+            features.append("p+1=" + p_right)
+            features.append("p+2=" + p_right_2)
+            features.append("p+3=" + p_right_3)
+            features.append("p+w=" + p0 + "+" + normal)
+            features.append("p+1+w=" + p_right + "+" + normal)
+            features.append("p+p+1=" + p0 + "+" + p_right)
+            features.append("p-1+p=" + p_left + "+" + p0)
+            features.append("p-1+p+p+1=" + p_left + "+" + p0 + "+" + p_right)
+            features.append("p+1+p+2=" + p_right + "+" + p_right_2)
+            features.append("p+p+1+p+2=" + p0 + "+" + p_right + "+" + p_right_2)
+            features.append("t-1+p+1=" + previous_tag + "+" + p_right)
+            features.append("t-1+p+p+1=" + previous_tag + "+" + p0 + "+" + p_right)
+            features.append("t-2+t-1+p+1=" + previous_tag_2 + "+" + previous_tag + "+" + p_right)
         return features
 
-    def tag(self, words, correct_tags=None):
+    def tag(self, words, correct_tags=None, first_tags=None):
         """
         Tag one sentence. Returns a list of tags, with "<ROOT>" at position 0.
 
@@ -96,7 +137,7 @@ class Tagger:
         previous_tag = START
         previous_tag_2 = START
         for i in range(1, len(words)):
-            features = self.get_features(words, normal_words, i, previous_tag, previous_tag_2)
+            features = self.get_features(words, normal_words, i, previous_tag, previous_tag_2, first_tags)
             rows = self.model.feature_rows(features)
             scores = self.model.scores(rows)
             guess = int(scores.argmax())
@@ -114,26 +155,32 @@ class Tagger:
             previous_tag = guessed_tag
         return tags
 
-    def train(self, sentences, epochs, seed=1):
-        """Train on sentences; the "labels" of the sentence are the tags to learn."""
+    def train(self, sentences, epochs, seed=1, first_tags_list=None):
+        """
+        Train on sentences; the "labels" of the sentence are the tags to learn.
+        first_tags_list (optional) = first-pass tags of every sentence.
+        """
         random_generator = random.Random(seed)
         order = list(range(len(sentences)))
         for epoch in range(epochs):
             random_generator.shuffle(order)
             for k in order:
                 sentence = sentences[k]
-                self.tag(sentence["words"], sentence["labels"])
+                first_tags = None
+                if first_tags_list is not None:
+                    first_tags = first_tags_list[k]
+                self.tag(sentence["words"], sentence["labels"], first_tags)
                 self.model.next_step()
         self.model.average_weights()
 
 
-def train_tagger(sentences, tag_names, epochs):
+def train_tagger(sentences, tag_names, epochs, first_tags_list=None):
     tagger = Tagger(tag_names)
-    tagger.train(sentences, epochs)
+    tagger.train(sentences, epochs, 1, first_tags_list)
     return tagger
 
 
-def jackknife_tags(sentences, tag_names, epochs, n_folds=5):
+def jackknife_tags(sentences, tag_names, epochs, n_folds=5, first_tags_list=None):
     """
     Give tags to the TRAINING sentences in a fair way.
 
@@ -149,16 +196,25 @@ def jackknife_tags(sentences, tag_names, epochs, n_folds=5):
 
     for fold in range(n_folds):
         train_part = []
+        train_part_first_tags = []
         held_out = []
         for k in range(len(sentences)):
             if k % n_folds == fold:
                 held_out.append(k)
             else:
                 train_part.append(sentences[k])
+                if first_tags_list is not None:
+                    train_part_first_tags.append(first_tags_list[k])
 
-        tagger = train_tagger(train_part, tag_names, epochs)
+        if first_tags_list is None:
+            tagger = train_tagger(train_part, tag_names, epochs)
+        else:
+            tagger = train_tagger(train_part, tag_names, epochs, train_part_first_tags)
         for k in held_out:
-            all_tags[k] = tagger.tag(sentences[k]["words"])
+            first_tags = None
+            if first_tags_list is not None:
+                first_tags = first_tags_list[k]
+            all_tags[k] = tagger.tag(sentences[k]["words"], None, first_tags)
         print("    jackknife fold", fold + 1, "of", n_folds, "done")
     return all_tags
 

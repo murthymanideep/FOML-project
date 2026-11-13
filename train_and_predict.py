@@ -6,6 +6,11 @@ Main script: trains everything and writes the submission file.
     python train_and_predict.py --check   -> train on 90% of the training data
                                              and print the score on the other 10%
 
+Extra options (can be combined with --check):
+    --one-parser       train only the first parser (fast, for experiments)
+    --no-second-pass   do not use the second-pass tagger
+    --no-copy          do not copy answers of sentences seen in training
+
 Steps:
   1. Read the data.
   2. Train a tagger and give every word a tag (a guess of its relation).
@@ -41,7 +46,17 @@ PARSERS = [
     ("left-to-right", 2),
     ("right-to-left", 2),
     ("left-to-right", 3),
+    ("right-to-left", 3),
+    ("left-to-right", 4),
 ]
+
+# Second-pass tagger: a second tagger that can also see the first tagger's
+# guesses for the words on the right. Switch off with --no-second-pass.
+USE_SECOND_PASS_TAGGER = True
+
+# If a test sentence is word-for-word the same as a training sentence, copy
+# the training answer. Switch off with --no-copy.
+COPY_KNOWN_SENTENCES = True
 
 # --------------------------------------------------------------------
 
@@ -74,7 +89,59 @@ def make_tags(train_sentences, other_sentence_lists):
         for sentence in sentences:
             tags_list.append(tagger.tag(sentence["words"]))
         other_tags_lists.append(tags_list)
-    return train_tags, other_tags_lists
+    tagger = None
+    gc.collect()
+
+    if not USE_SECOND_PASS_TAGGER:
+        return train_tags, other_tags_lists
+
+    # ----- second pass -----
+    # The second tagger gets the first tagger's guesses as extra features.
+    # For the training sentences these guesses are the jackknifed ones, so
+    # they contain realistic mistakes. The output for the training sentences
+    # is jackknifed again, for the same reason as before.
+    print("Training the second-pass tagger (jackknifing)...")
+    train_tags_2 = jackknife_tags(tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, train_tags)
+    print("    second-pass tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_2))
+
+    print("Training the second-pass tagger on all training sentences...")
+    tagger_2 = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, train_tags)
+    other_tags_lists_2 = []
+    for j in range(len(other_sentence_lists)):
+        sentences = other_sentence_lists[j]
+        tags_list = []
+        for k in range(len(sentences)):
+            tags_list.append(tagger_2.tag(sentences[k]["words"], None, other_tags_lists[j][k]))
+        other_tags_lists_2.append(tags_list)
+    tagger_2 = None
+    gc.collect()
+    return train_tags_2, other_tags_lists_2
+
+
+def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
+    """
+    If a sentence has exactly the same words as a training sentence, use the
+    training answer for it. (Skipped when the training data has two
+    different answers for the same words.) Returns how many were copied.
+    """
+    answer_of_words = {}
+    for sentence in train_sentences:
+        key = "\t".join(sentence["words"])
+        answer = (sentence["heads"], sentence["labels"])
+        if key not in answer_of_words:
+            answer_of_words[key] = answer
+        elif answer_of_words[key] is not None and answer_of_words[key] != answer:
+            answer_of_words[key] = None     # training data disagrees with itself
+
+    copied = 0
+    for k in range(len(sentences)):
+        key = "\t".join(sentences[k]["words"])
+        answer = answer_of_words.get(key)
+        if answer is not None:
+            all_heads[k] = answer[0]
+            all_labels[k] = answer[1]
+            copied = copied + 1
+    return copied
 
 
 def train_one_parser(direction, seed, label_names, train_sentences, train_tags, sentence_lists, tags_lists):
@@ -185,6 +252,11 @@ def check_mode(all_train):
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
         print("    vote of %d parsers: UAS %.2f  LAS %.2f   <- LAS is the competition score" % (len(predictions), uas, las))
 
+    if COPY_KNOWN_SENTENCES:
+        copied = copy_known_sentences(train_sentences, dev_sentences, voted_heads, voted_labels)
+        uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
+        print("After copying %d known sentences: UAS %.2f  LAS %.2f" % (copied, uas, las))
+
 
 def final_mode(train_sentences):
     """Train on all training data and write the submission."""
@@ -208,6 +280,9 @@ def final_mode(train_sentences):
         gc.collect()
 
     test_heads, test_labels = vote(test_predictions, test_sentences)
+    if COPY_KNOWN_SENTENCES:
+        copied = copy_known_sentences(train_sentences, test_sentences, test_heads, test_labels)
+        print("Copied the training answer for", copied, "test sentences")
     train_heads, train_labels = vote(train_predictions, train_sentences)
     uas, las = accuracy(train_sentences, train_heads, train_labels)
     print("Score on the training data itself (too optimistic): UAS %.2f  LAS %.2f" % (uas, las))
@@ -229,6 +304,13 @@ def final_mode(train_sentences):
 
 
 def main():
+    global PARSERS, USE_SECOND_PASS_TAGGER, COPY_KNOWN_SENTENCES
+    if "--one-parser" in sys.argv:
+        PARSERS = PARSERS[:1]
+    if "--no-second-pass" in sys.argv:
+        USE_SECOND_PASS_TAGGER = False
+    if "--no-copy" in sys.argv:
+        COPY_KNOWN_SENTENCES = False
     start_time = time.time()
     train_sentences = read_sentences(os.path.join(DATA_FOLDER, "train.csv"))
     if "--check" in sys.argv:

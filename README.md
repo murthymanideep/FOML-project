@@ -39,9 +39,17 @@ methods: **averaged perceptrons** with hand-made features.
 
    This writes `outputs/submission.csv`. Upload this file to Kaggle.
 
-Each run takes around 15 to 25 minutes on a normal laptop and uses about
+Each full run takes around 25 to 35 minutes on a normal laptop and uses about
 1.5 GB of memory.
 
+
+Extra options, useful for quick experiments (combine them with `--check`):
+
+| Option | Meaning |
+|--------|---------|
+| `--one-parser` | Train only one parser instead of 7 (much faster). |
+| `--no-second-pass` | Do not use the second-pass tagger. |
+| `--no-copy` | Do not copy the answers of sentences seen in training. |
 
 ## The files
 
@@ -80,6 +88,11 @@ much. So we split the training data into 5 parts and tag each part with a
 tagger trained on the other 4 parts. Now the training tags have realistic
 mistakes too.
 
+**Second pass.** A left-to-right tagger cannot see the tags of the words
+on its right, because it has not tagged them yet. So we run a second tagger
+that gets the first tagger's guesses for the whole sentence as extra
+features. Now it can use (guessed) tags on both sides of each word.
+
 ### Step 2: The parser
 
 The parser builds the tree step by step (a "transition-based" parser, using
@@ -111,11 +124,14 @@ new sentences.
 
 ### Step 3: Voting
 
-We train 5 parsers: 3 read the sentence from left to right and 2 read it
+We train 7 parsers: 4 read the sentence from left to right and 3 read it
 from right to left. They also use different random orders of the training
 sentences. Each parser makes slightly different mistakes. For every word we
 take the head that most parsers chose, and then the most common label among
 the parsers that chose that head.
+
+**Known sentences.** If a test sentence has exactly the same words as a
+training sentence (for example "Thanks !"), we copy the training answer.
 
 ### The averaged perceptron (`perceptron.py`)
 
@@ -144,6 +160,13 @@ test on the other 10%). The competition score is LAS.
 
 Single right-to-left parsers are weaker (about 77.3 LAS), but they make
 different mistakes, so they still improve the vote.
+
+The scores in the table are from the first version (5 parsers, one tagger
+pass). The second-pass tagger, the 7 parsers and the copying of known
+sentences were added later; run `--check` to measure them.
+
+On Kaggle the first version scored 0.7803. The test sentences are a bit
+harder than our held-out sentences (more unknown words: 6.6% against 4.0%).
 
 Things we tried that did not help enough:
 
