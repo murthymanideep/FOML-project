@@ -1,26 +1,18 @@
 """
-A multi-class averaged perceptron.
+A fast multi-class averaged perceptron with bitmasked feature hashing
+and optional margin-scaled updates.
 
-How it works, in short:
-
-  * Every decision is described by a list of "features". A feature is a
-    short piece of text, for example "word=the" or "s0t+n0t=det+nsubj".
+How it works:
+  * Every decision is described by a list of discrete features.
   * Every feature has one weight per class (per possible answer).
   * The score of a class is the sum of the weights of all present features.
-    The class with the highest score is the prediction.
-  * Training: when the prediction is wrong, add 1 to the weights of the
-    correct class and subtract 1 from the weights of the predicted class.
+  * Training: when the prediction is wrong (or within the safety margin),
+    add `scale` to the weights of the correct class and subtract `scale`
+    from the weights of the predicted class.
   * Averaging: at the end we use the average of the weights over all training
-    steps instead of the last weights. This is much more stable.
-
-Storage: all weights live in one big numpy table with one row per feature and
-one column per class. To find the row of a feature we use a hash function
-(crc32), which turns the text into a number. Two different features can
-sometimes land on the same row, but that happens rarely enough to not matter
-much, and it keeps the memory use fixed.
+    steps instead of the final step weights, which is much more stable and
+    generalizes significantly better.
 """
-
-import zlib
 
 import numpy as np
 
@@ -30,53 +22,50 @@ class AveragedPerceptron:
     def __init__(self, n_classes, n_rows):
         self.n_classes = n_classes
         self.n_rows = n_rows
+        self.mask = n_rows - 1 if (n_rows & (n_rows - 1)) == 0 else None
         self.weights = np.zeros((n_rows, n_classes), dtype=np.float32)
-        # "totals" is used to compute the average weights cheaply (see below).
         self.totals = np.zeros((n_rows, n_classes), dtype=np.float32)
         self.step = 1
         self.is_averaged = False
 
     def feature_rows(self, features):
-        """Turn a list of feature texts into a list of row numbers."""
-        rows = []
-        for feature in features:
-            number = zlib.crc32(feature.encode("utf-8"))
-            rows.append(number % self.n_rows)
-        return rows
+        """Turn a list of feature strings into a numpy array of row indices."""
+        mask = self.mask
+        if mask is not None:
+            return np.fromiter((hash(f) & mask for f in features), dtype=np.int32, count=len(features))
+        n_rows = self.n_rows
+        return np.fromiter((hash(f) % n_rows for f in features), dtype=np.int32, count=len(features))
 
     def scores(self, rows, use_average=False):
         """Return a numpy array with the score of every class."""
         if use_average and not self.is_averaged:
-            # Average weight = weights - totals / step  (see average_weights).
-            table = self.weights[rows] - self.totals[rows] / self.step
-        else:
-            table = self.weights[rows]
-        return table.sum(axis=0)
+            table = self.weights[rows] - self.totals[rows] * (1.0 / self.step)
+            return table.sum(axis=0)
+        return self.weights[rows].sum(axis=0)
 
-    def update(self, rows, correct_class, predicted_class):
+    def update(self, rows, correct_class, predicted_class, scale=1.0):
         """The perceptron rule: reward the correct class, punish the wrong one."""
         if correct_class == predicted_class:
             return
-        self.weights[rows, correct_class] += 1.0
-        self.weights[rows, predicted_class] -= 1.0
-        # Remember *when* the change happened, to compute the average later.
-        self.totals[rows, correct_class] += self.step
-        self.totals[rows, predicted_class] -= self.step
+        step_scale = np.float32(scale * self.step)
+        s = np.float32(scale)
+        self.weights[rows, correct_class] += s
+        self.weights[rows, predicted_class] -= s
+        self.totals[rows, correct_class] += step_scale
+        self.totals[rows, predicted_class] -= step_scale
 
     def next_step(self):
-        """Call this once after each training example (we use one sentence)."""
-        self.step = self.step + 1
+        """Call this once after each training example (one sentence)."""
+        self.step += 1
 
     def average_weights(self):
         """
-        Replace the weights by their average over all steps.
-
-        A change of +1 made at step t is present in the weights for the
-        remaining (step - t) steps, so its share of the average is
-        1 - t / step. Summing over all changes gives:
+        Replace the weights by their average over all training steps:
             average = weights - totals / step
         """
-        np.divide(self.totals, self.step, out=self.totals)
+        if self.is_averaged or self.totals is None:
+            return
+        np.divide(self.totals, np.float32(self.step), out=self.totals)
         self.weights -= self.totals
-        self.totals = None   # not needed any more, frees memory
+        self.totals = None
         self.is_averaged = True
