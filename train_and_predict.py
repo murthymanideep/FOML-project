@@ -10,6 +10,9 @@ Extra options (can be combined with --check):
     --one-parser       train only the first parser (fast, for experiments)
     --no-second-pass   do not use the second-pass tagger
     --no-copy          do not copy answers of sentences seen in training
+    --stack            stacking: final parsers see the answers of guide parsers
+    --big-table        use a weight table twice as big (needs about 1.8 GB)
+    --tiny             use only 300 sentences, to test that the code runs
 
 Steps:
   1. Read the data.
@@ -57,6 +60,16 @@ USE_SECOND_PASS_TAGGER = True
 # If a test sentence is word-for-word the same as a training sentence, copy
 # the training answer. Switch off with --no-copy.
 COPY_KNOWN_SENTENCES = True
+
+# Stacking: first train "guide" parsers, then let the final parsers look at
+# the guides' answers. Switch on with --stack.
+USE_STACKING = False
+GUIDE_PARSERS = [("left-to-right", 101), ("right-to-left", 101)]
+GUIDE_EPOCHS = 6
+
+# Size of the parser's weight table: 2 ** PARSER_TABLE_BITS rows.
+# 20 needs about 0.9 GB of memory, 21 (option --big-table) about 1.8 GB.
+PARSER_TABLE_BITS = 20
 
 # --------------------------------------------------------------------
 
@@ -144,23 +157,45 @@ def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
     return copied
 
 
-def train_one_parser(direction, seed, label_names, train_sentences, train_tags, sentence_lists, tags_lists):
-    """Train one parser and return its (heads, labels) for each list of sentences."""
+def flip_guides(guides):
+    """Turn the guides of one sentence around (for a right-to-left parser)."""
+    if guides is None:
+        return None
+    flipped = []
+    for (heads, labels) in guides:
+        flipped.append(flip_result(heads, labels))
+    return flipped
+
+
+def train_one_parser(direction, seed, label_names, epochs, train_sentences, train_tags,
+                     sentence_lists, tags_lists, train_guides=None, guides_lists=None):
+    """
+    Train one parser and return its (heads, labels) for each list of sentences.
+
+    train_guides / guides_lists are only used with stacking: for every
+    sentence, the answers of the guide parsers.
+    """
+    guides_for_training = None
     if direction == "right-to-left":
         sentences_for_training = []
         tags_for_training = []
         for k in range(len(train_sentences)):
             sentences_for_training.append(flip_sentence(train_sentences[k]))
             tags_for_training.append(flip_list(train_tags[k]))
+        if train_guides is not None:
+            guides_for_training = []
+            for k in range(len(train_sentences)):
+                guides_for_training.append(flip_guides(train_guides[k]))
     else:
         sentences_for_training = train_sentences
         tags_for_training = train_tags
+        guides_for_training = train_guides
 
-    parser = Parser(label_names)
+    parser = Parser(label_names, 2 ** PARSER_TABLE_BITS)
     random_generator = random.Random(seed)
-    for epoch in range(PARSER_EPOCHS):
-        parser.train_one_epoch(sentences_for_training, tags_for_training, random_generator)
-        print("    epoch", epoch + 1, "of", PARSER_EPOCHS, "done")
+    for epoch in range(epochs):
+        parser.train_one_epoch(sentences_for_training, tags_for_training, random_generator, guides_for_training)
+        print("    epoch", epoch + 1, "of", epochs, "done")
     parser.model.average_weights()
 
     results = []
@@ -170,16 +205,93 @@ def train_one_parser(direction, seed, label_names, train_sentences, train_tags, 
         all_heads = []
         all_labels = []
         for k in range(len(sentences)):
+            guides = None
+            if guides_lists is not None:
+                guides = guides_lists[j][k]
             if direction == "right-to-left":
                 flipped = flip_sentence(sentences[k])
-                heads, labels = parser.parse(flipped["words"], flip_list(tags_list[k]))
+                heads, labels = parser.parse(flipped["words"], flip_list(tags_list[k]), False, flip_guides(guides))
                 heads, labels = flip_result(heads, labels)
             else:
-                heads, labels = parser.parse(sentences[k]["words"], tags_list[k])
+                heads, labels = parser.parse(sentences[k]["words"], tags_list[k], False, guides)
             all_heads.append(heads)
             all_labels.append(labels)
         results.append((all_heads, all_labels))
+    parser = None
+    gc.collect()
     return results
+
+
+def make_guides(label_names, train_sentences, train_tags, other_sentence_lists, other_tags_lists):
+    """
+    Stacking, round 1: make the "guides" (answers of the guide parsers).
+
+    For the TRAINING sentences we use jackknifing again: the sentences are
+    split into parts, and each part is parsed by guide parsers trained on
+    the other parts. This way the guides make realistic mistakes on the
+    training sentences, just like they will on the test sentences.
+
+    For the other sentences (dev or test) the guide parsers are trained on
+    all training sentences.
+
+    Returns (train_guides, other_guides_lists). The guides of one sentence
+    are a list with one (heads, labels) pair per guide parser.
+    """
+    n = len(train_sentences)
+    train_guides = []
+    for k in range(n):
+        train_guides.append([])
+
+    for fold in range(JACKKNIFE_FOLDS):
+        part_sentences = []
+        part_tags = []
+        held_out = []
+        held_out_sentences = []
+        held_out_tags = []
+        for k in range(n):
+            if k % JACKKNIFE_FOLDS == fold:
+                held_out.append(k)
+                held_out_sentences.append(train_sentences[k])
+                held_out_tags.append(train_tags[k])
+            else:
+                part_sentences.append(train_sentences[k])
+                part_tags.append(train_tags[k])
+
+        for (direction, seed) in GUIDE_PARSERS:
+            print("Guide parser, fold", fold + 1, "of", JACKKNIFE_FOLDS, ":", direction)
+            results = train_one_parser(direction, seed, label_names, GUIDE_EPOCHS, part_sentences, part_tags,
+                                       [held_out_sentences], [held_out_tags])
+            all_heads, all_labels = results[0]
+            for position in range(len(held_out)):
+                k = held_out[position]
+                train_guides[k].append((all_heads[position], all_labels[position]))
+
+    # How good are the guides on the training sentences?
+    for g in range(len(GUIDE_PARSERS)):
+        guide_heads = []
+        guide_labels = []
+        for k in range(n):
+            guide_heads.append(train_guides[k][g][0])
+            guide_labels.append(train_guides[k][g][1])
+        uas, las = accuracy(train_sentences, guide_heads, guide_labels)
+        print("    guide %d on training data (jackknifed): UAS %.2f  LAS %.2f" % (g, uas, las))
+
+    other_guides_lists = []
+    for sentences in other_sentence_lists:
+        guides_list = []
+        for k in range(len(sentences)):
+            guides_list.append([])
+        other_guides_lists.append(guides_list)
+
+    for (direction, seed) in GUIDE_PARSERS:
+        print("Guide parser on all training sentences:", direction)
+        results = train_one_parser(direction, seed, label_names, GUIDE_EPOCHS, train_sentences, train_tags,
+                                   other_sentence_lists, other_tags_lists)
+        for j in range(len(other_sentence_lists)):
+            all_heads, all_labels = results[j]
+            for k in range(len(other_sentence_lists[j])):
+                other_guides_lists[j][k].append((all_heads[k], all_labels[k]))
+    return train_guides, other_guides_lists
 
 
 def vote(predictions, sentences):
@@ -240,10 +352,24 @@ def check_mode(all_train):
     dev_tags = other_tags[0]
     print("    tag accuracy on check data: %.2f" % tag_accuracy(make_tag_targets(dev_sentences), dev_tags))
 
+    train_guides = None
+    dev_guides_lists = None
+    if USE_STACKING:
+        train_guides, dev_guides_lists = make_guides(label_names, train_sentences, train_tags, [dev_sentences], [dev_tags])
+        for g in range(len(GUIDE_PARSERS)):
+            guide_heads = []
+            guide_labels = []
+            for k in range(len(dev_sentences)):
+                guide_heads.append(dev_guides_lists[0][k][g][0])
+                guide_labels.append(dev_guides_lists[0][k][g][1])
+            uas, las = accuracy(dev_sentences, guide_heads, guide_labels)
+            print("    guide %d on check data: UAS %.2f  LAS %.2f" % (g, uas, las))
+
     predictions = []
     for (direction, seed) in PARSERS:
         print("Training parser:", direction, "seed", seed)
-        results = train_one_parser(direction, seed, label_names, train_sentences, train_tags, [dev_sentences], [dev_tags])
+        results = train_one_parser(direction, seed, label_names, PARSER_EPOCHS, train_sentences, train_tags,
+                                   [dev_sentences], [dev_tags], train_guides, dev_guides_lists)
         predictions.append(results[0])
         gc.collect()
         uas, las = accuracy(dev_sentences, results[0][0], results[0][1])
@@ -269,12 +395,19 @@ def final_mode(train_sentences):
 
     # The sample file also lists the IDs of the training rows, so we predict
     # those too (with the same models) to fill every row of the submission.
+    train_guides = None
+    guides_lists = None
+    if USE_STACKING:
+        train_guides, test_guides_lists = make_guides(label_names, train_sentences, train_tags, [test_sentences], [test_tags])
+        guides_lists = [test_guides_lists[0], train_guides]
+
     test_predictions = []
     train_predictions = []
     for (direction, seed) in PARSERS:
         print("Training parser:", direction, "seed", seed)
-        results = train_one_parser(direction, seed, label_names, train_sentences, train_tags,
-                                   [test_sentences, train_sentences], [test_tags, train_tags])
+        results = train_one_parser(direction, seed, label_names, PARSER_EPOCHS, train_sentences, train_tags,
+                                   [test_sentences, train_sentences], [test_tags, train_tags],
+                                   train_guides, guides_lists)
         test_predictions.append(results[0])
         train_predictions.append(results[1])
         gc.collect()
@@ -304,7 +437,12 @@ def final_mode(train_sentences):
 
 
 def main():
-    global PARSERS, USE_SECOND_PASS_TAGGER, COPY_KNOWN_SENTENCES
+    global PARSERS, USE_SECOND_PASS_TAGGER, COPY_KNOWN_SENTENCES, USE_STACKING
+    global PARSER_TABLE_BITS, PARSER_EPOCHS, GUIDE_EPOCHS, TAGGER_EPOCHS
+    if "--stack" in sys.argv:
+        USE_STACKING = True
+    if "--big-table" in sys.argv:
+        PARSER_TABLE_BITS = 21
     if "--one-parser" in sys.argv:
         PARSERS = PARSERS[:1]
     if "--no-second-pass" in sys.argv:
@@ -313,7 +451,14 @@ def main():
         COPY_KNOWN_SENTENCES = False
     start_time = time.time()
     train_sentences = read_sentences(os.path.join(DATA_FOLDER, "train.csv"))
-    if "--check" in sys.argv:
+    if "--tiny" in sys.argv:
+        # Only to test quickly that the code runs. The scores mean nothing.
+        train_sentences = train_sentences[:300]
+        PARSER_EPOCHS = 1
+        GUIDE_EPOCHS = 1
+        TAGGER_EPOCHS = 1
+        PARSER_TABLE_BITS = 14
+    if "--check" in sys.argv or "--tiny" in sys.argv:
         check_mode(train_sentences)
     else:
         final_mode(train_sentences)

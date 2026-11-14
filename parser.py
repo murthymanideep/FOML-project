@@ -229,7 +229,7 @@ class Parser:
 
     # ----- features -----
 
-    def get_features(self, words, tags, state):
+    def get_features(self, words, tags, state, guides=None):
         s0 = state.stack_word(0)
         s1 = state.stack_word(1)
         s2 = state.stack_word(2)
@@ -408,6 +408,10 @@ class Parser:
         f.append("s0-1t+s0t+n0t=" + t(s0_before) + "+" + s0t + "+" + n0t)
         f.append("s0t+n0-1t+n0t=" + s0t + "+" + t(n0_before) + "+" + n0t)
         f.append("s0t+s0+1t+n0-1t+n0t=" + s0t + "+" + t(s0_after) + "+" + t(n0_before) + "+" + n0t)
+
+        # Stacking: features that say what the first-round parsers decided.
+        if guides is not None:
+            add_guide_features(f, guides, state, s0, s1, n0, s0t, n0t)
         return f
 
     # ----- choosing moves -----
@@ -454,19 +458,19 @@ class Parser:
                 result[1 + L:] = scores[1 + L:]
         return result
 
-    def parse(self, words, tags, use_average=False):
+    def parse(self, words, tags, use_average=False, guides=None):
         """Parse one sentence. Returns (heads, labels), position 0 unused."""
         normal_words = normalize_all(words)
         state = ParserState(len(words) - 1)
         while not state.is_finished():
-            features = self.get_features(normal_words, tags, state)
+            features = self.get_features(normal_words, tags, state, guides)
             rows = self.model.feature_rows(features)
             scores = self.allowed_scores(self.model.scores(rows, use_average), state)
             move, label = self.move_of(int(scores.argmax()))
             state.apply(move, label)
         return state.heads, state.labels
 
-    def train_one_sentence(self, words, tags, gold_heads, gold_labels):
+    def train_one_sentence(self, words, tags, gold_heads, gold_labels, guides=None):
         normal_words = normalize_all(words)
         n = len(words) - 1
 
@@ -479,7 +483,7 @@ class Parser:
 
         state = ParserState(n)
         while not state.is_finished():
-            features = self.get_features(normal_words, tags, state)
+            features = self.get_features(normal_words, tags, state, guides)
             rows = self.model.feature_rows(features)
             scores = self.model.scores(rows)
 
@@ -492,12 +496,116 @@ class Parser:
             state.apply(move, label)
         self.model.next_step()
 
-    def train_one_epoch(self, sentences, tags_list, random_generator):
+    def train_one_epoch(self, sentences, tags_list, random_generator, guides_list=None):
         order = list(range(len(sentences)))
         random_generator.shuffle(order)
         for k in order:
             sentence = sentences[k]
-            self.train_one_sentence(sentence["words"], tags_list[k], sentence["heads"], sentence["labels"])
+            guides = None
+            if guides_list is not None:
+                guides = guides_list[k]
+            self.train_one_sentence(sentence["words"], tags_list[k], sentence["heads"], sentence["labels"], guides)
+
+
+# ----- stacking ("guide" features) -----
+#
+# Stacking means: first-round parsers parse the sentence, and a second-round
+# parser may look at their answers while it builds its own tree. A "guide"
+# is the answer of one first-round parser: (heads, labels) for one sentence.
+# The second-round parser learns when to trust the guides and when not to.
+
+def guide_view(guide_heads, guide_labels, state, s0, s1, n0):
+    """
+    Describe what one guide says about the current situation.
+    Returns four short texts:
+      where_s0 : where the guide puts the head of s0
+                 ("n0", "s1", "buffer" = later in the buffer, "other")
+      label_s0 : the guide's label for s0
+      where_n0 : where the guide puts the head of n0
+                 ("s0", "root", "right", "left")
+      waiting  : how many buffer words the guide attaches to s0
+                 ("0", "1", "2+"). If not 0, s0 should stay on the stack.
+    """
+    if s0 == NONE:
+        where_s0 = "none"
+        label_s0 = "none"
+        waiting = "none"
+    else:
+        head = guide_heads[s0]
+        if head == n0:
+            where_s0 = "n0"
+        elif head == s1:
+            where_s0 = "s1"
+        elif state.in_buffer(head):
+            where_s0 = "buffer"
+        else:
+            where_s0 = "other"
+        label_s0 = guide_labels[s0]
+
+        count = 0
+        for word in range(state.buffer_position, state.n + 1):
+            if guide_heads[word] == s0:
+                count = count + 1
+        if count >= 2:
+            waiting = "2+"
+        else:
+            waiting = str(count)
+
+    if n0 == 0:
+        where_n0 = "none"
+    else:
+        head = guide_heads[n0]
+        if head == s0:
+            where_n0 = "s0"
+        elif head == 0:
+            where_n0 = "root"
+        elif head > n0:
+            where_n0 = "right"
+        else:
+            where_n0 = "left"
+    return where_s0, label_s0, where_n0, waiting
+
+
+def add_guide_features(f, guides, state, s0, s1, n0, s0t, n0t):
+    """Add the guide features of all guides to the feature list f."""
+    all_where_s0 = ""
+    all_label_s0 = ""
+    all_where_n0 = ""
+    all_waiting = ""
+    for g in range(len(guides)):
+        guide_heads = guides[g][0]
+        guide_labels = guides[g][1]
+        where_s0, label_s0, where_n0, waiting = guide_view(guide_heads, guide_labels, state, s0, s1, n0)
+        if n0 == 0:
+            label_n0 = "none"
+        else:
+            label_n0 = guide_labels[n0]
+
+        name = "g" + str(g) + ":"
+        f.append(name + "s0=" + where_s0)
+        f.append(name + "s0+l=" + where_s0 + "+" + label_s0)
+        f.append(name + "s0+wait=" + where_s0 + "+" + waiting)
+        f.append(name + "s0+l+wait=" + where_s0 + "+" + label_s0 + "+" + waiting)
+        f.append(name + "n0=" + where_n0)
+        f.append(name + "n0+l=" + where_n0 + "+" + label_n0)
+        f.append(name + "s0+n0=" + where_s0 + "+" + where_n0)
+        f.append(name + "s0+wait+n0=" + where_s0 + "+" + waiting + "+" + where_n0)
+        f.append(name + "s0+l+s0t=" + where_s0 + "+" + label_s0 + "+" + s0t)
+        f.append(name + "n0+l+n0t=" + where_n0 + "+" + label_n0 + "+" + n0t)
+        f.append(name + "s0+wait+s0t+n0t=" + where_s0 + "+" + waiting + "+" + s0t + "+" + n0t)
+
+        all_where_s0 = all_where_s0 + "+" + where_s0
+        all_label_s0 = all_label_s0 + "+" + label_s0
+        all_where_n0 = all_where_n0 + "+" + where_n0
+        all_waiting = all_waiting + "+" + waiting
+
+    # What the guides say together (do they agree?).
+    if len(guides) >= 2:
+        f.append("g:s0=" + all_where_s0)
+        f.append("g:s0+wait=" + all_where_s0 + all_waiting)
+        f.append("g:s0+l=" + all_where_s0 + all_label_s0)
+        f.append("g:n0=" + all_where_n0)
+        f.append("g:s0+n0=" + all_where_s0 + all_where_n0)
 
 
 def label_set(state, children):

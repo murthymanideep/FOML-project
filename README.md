@@ -50,6 +50,9 @@ Extra options, useful for quick experiments (combine them with `--check`):
 | `--one-parser` | Train only one parser instead of 7 (much faster). |
 | `--no-second-pass` | Do not use the second-pass tagger. |
 | `--no-copy` | Do not copy the answers of sentences seen in training. |
+| `--stack` | Stacking (see below). Slower: adds about 20 minutes. |
+| `--big-table` | Weight table twice as big. Needs about 1.8 GB of free memory. |
+| `--tiny` | Use only 300 sentences. Only to test that the code runs (20 seconds). |
 
 ## The files
 
@@ -132,6 +135,27 @@ the parsers that chose that head.
 
 **Known sentences.** If a test sentence has exactly the same words as a
 training sentence (for example "Thanks !"), we copy the training answer.
+
+### Optional: stacking (`--stack`)
+
+With stacking, parsing happens in two rounds:
+
+1. Two **guide parsers** (one left-to-right, one right-to-left) parse every
+   sentence.
+2. The final parsers get the guides' answers as extra features. For example:
+   "guide 0 says the head of the top stack word is the next buffer word, with
+   label `det`", or "the guides disagree here". The final parsers learn when
+   to trust the guides.
+
+For the training sentences the guides are made with jackknifing (each part
+is parsed by guide parsers trained on the other parts), for the same reason
+as with the tagger.
+
+### Optional: bigger weight table (`--big-table`)
+
+The parser has about 4 million different features but the weight table has
+only 1 million rows, so several features share a row. A table with 2 million
+rows reduces this sharing.
 
 ### The averaged perceptron (`perceptron.py`)
 
