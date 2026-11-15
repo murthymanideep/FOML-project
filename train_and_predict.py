@@ -1,10 +1,10 @@
 """
-Main script: trains the bidirectional two-pass tagger, global-context
-head-offset supertagger, global first-order Graph-MST structured perceptron,
-full-tree 2nd/3rd-order label classifier, and heterogeneous (Arc-Hybrid +
-Arc-Eager, L-to-R + R-to-L) graph-guided transition parser ensemble, then
-decodes the globally optimal parse tree via Chu-Liu/Edmonds Maximum Spanning
-Arborescence and writes the submission file.
+Main script: trains the Induced UPOS tagger, bidirectional two-pass syntactic
+tagger, global-context head-offset supertagger, 2-seed Global First-Order
+Graph-MST structured perceptron, full-tree 2nd/3rd-order label classifier, and
+3-system (Arc-Hybrid + Arc-Eager + Arc-Standard, L-to-R + R-to-L) graph-guided
+transition parser ensemble, then decodes the globally optimal parse tree via
+Chu-Liu/Edmonds Maximum Spanning Arborescence and writes the submission file.
 
     python train_and_predict.py           -> train on all training data,
                                              write outputs/submission.csv
@@ -36,6 +36,7 @@ from data_utils import (
 from tagger import (
     train_tagger,
     jackknife_tags,
+    make_upos_targets,
     make_tag_targets,
     make_supertag_targets,
     tag_accuracy,
@@ -43,10 +44,12 @@ from tagger import (
 from parser import (
     Parser,
     ArcEagerParser,
+    ArcStandardParser,
     GraphMSTParser,
     FullTreeLabeler,
     jackknife_mst,
     chu_liu_edmonds,
+    flip_list,
     flip_sentence,
     flip_tags,
     flip_supertags,
@@ -62,26 +65,29 @@ import numpy as np
 DATA_FOLDER = "data"
 OUTPUT_FOLDER = "outputs"
 
+UPOS_EPOCHS = 6
 TAGGER_EPOCHS = 6
 SUPERTAGGER_EPOCHS = 5
-MST_EPOCHS = 7
-TREE_LABELER_EPOCHS = 5
+MST_EPOCHS = 8
+TREE_LABELER_EPOCHS = 6
 JACKKNIFE_FOLDS = 5
 PARSER_EPOCHS = 12
 
-# Heterogeneous graph-guided transition parser ensemble:
+# 3-System Heterogeneous Graph-Guided Transition Parser Ensemble:
 # (system_type, reading_direction, random_seed, vote_weight)
 PARSERS = [
-    ("arc-hybrid", "left-to-right", 1, 1.35),
-    ("arc-eager",  "left-to-right", 1, 1.25),
-    ("arc-hybrid", "right-to-left", 1, 1.05),
-    ("arc-hybrid", "left-to-right", 2, 1.30),
-    ("arc-eager",  "left-to-right", 2, 1.20),
-    ("arc-hybrid", "right-to-left", 2, 1.00),
-    ("arc-eager",  "right-to-left", 1, 0.95),
-    ("arc-hybrid", "left-to-right", 3, 1.30),
-    ("arc-hybrid", "left-to-right", 4, 1.30),
-    ("arc-eager",  "left-to-right", 3, 1.20),
+    ("arc-hybrid",   "left-to-right", 1, 1.35),
+    ("arc-eager",    "left-to-right", 1, 1.25),
+    ("arc-standard", "left-to-right", 1, 1.20),
+    ("arc-hybrid",   "right-to-left", 1, 1.05),
+    ("arc-eager",    "right-to-left", 1, 0.95),
+    ("arc-standard", "right-to-left", 1, 0.95),
+    ("arc-hybrid",   "left-to-right", 2, 1.30),
+    ("arc-eager",    "left-to-right", 2, 1.20),
+    ("arc-standard", "left-to-right", 2, 1.15),
+    ("arc-hybrid",   "right-to-left", 2, 1.00),
+    ("arc-hybrid",   "left-to-right", 3, 1.30),
+    ("arc-eager",    "left-to-right", 3, 1.20),
 ]
 
 USE_SECOND_PASS_TAGGER = True
@@ -102,50 +108,108 @@ def make_tags(train_sentences, other_sentence_lists):
     """
     Tag the training sentences with 5-fold jackknifing, and the other sentences
     (dev or test) with taggers trained on all training sentences:
-      1. Pass-1 Forward (Left-to-Right) tagger
-      2. Pass-1 Backward (Right-to-Left) tagger
-      3. Pass-2 Stacked tagger conditioned on Forward + Backward tags + Global Clause/Root Lookahead
-      4. Relative head-offset supertagger conditioned on Pass-2 + Backward tags + Global Lookahead
+      0. Induced Universal POS (`UPOS`) tagger (19 syntactic classes induced from gold trees)
+      1. Pass-1 Forward (Left-to-Right) tagger conditioned on `UPOS`
+      2. Pass-1 Backward (Right-to-Left) tagger conditioned on `UPOS`
+      3. Pass-2 Stacked tagger conditioned on Forward + Backward tags + `UPOS` + Global Lookahead
+      4. Relative head-offset supertagger conditioned on Pass-2 + Backward tags + `UPOS` + Global Lookahead
     """
+    # ----- 0. Induced Universal POS (UPOS) tagger -----
+    upos_sentences = make_upos_targets(train_sentences)
+    upos_names = get_label_names(upos_sentences)
+
+    print("Training the Induced UPOS tagger (jackknifing for training data)...")
+    train_upos = jackknife_tags(
+        upos_sentences, upos_names, UPOS_EPOCHS, JACKKNIFE_FOLDS, direction="left-to-right"
+    )
+    print("    Induced UPOS accuracy on training data (jackknifed): %.2f" % tag_accuracy(upos_sentences, train_upos))
+
+    print("Training the Induced UPOS tagger on all training sentences...")
+    upos_tagger = train_tagger(upos_sentences, upos_names, UPOS_EPOCHS, direction="left-to-right")
+    other_upos_lists = []
+    for sentences in other_sentence_lists:
+        u_list = [upos_tagger.tag(sentence["words"]) for sentence in sentences]
+        other_upos_lists.append(u_list)
+    upos_tagger = None
+    gc.collect()
+
+    # ----- 1. First-pass forward (Left-to-Right) tagger -----
     tag_sentences = make_tag_targets(train_sentences)
     tag_names = get_label_names(tag_sentences)
 
     print("Training the first-pass L-to-R tagger (jackknifing for training data)...")
     train_tags_fwd = jackknife_tags(
-        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, direction="left-to-right"
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        JACKKNIFE_FOLDS,
+        direction="left-to-right",
+        upos_tags_list=train_upos,
     )
     print("    L-to-R tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_fwd))
 
     print("Training the first-pass L-to-R tagger on all training sentences...")
-    tagger_fwd = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, direction="left-to-right")
+    tagger_fwd = train_tagger(
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        direction="left-to-right",
+        upos_tags_list=train_upos,
+    )
     other_tags_fwd = []
-    for sentences in other_sentence_lists:
-        tags_list = [tagger_fwd.tag(sentence["words"]) for sentence in sentences]
+    for j in range(len(other_sentence_lists)):
+        sentences = other_sentence_lists[j]
+        tags_list = [
+            tagger_fwd.tag(sentences[k]["words"], upos_tags=other_upos_lists[j][k])
+            for k in range(len(sentences))
+        ]
         other_tags_fwd.append(tags_list)
     tagger_fwd = None
     gc.collect()
 
     if not USE_SECOND_PASS_TAGGER:
         empty_super = [[None] * len(s) for s in other_sentence_lists]
-        return train_tags_fwd, other_tags_fwd, [None] * len(train_sentences), empty_super
+        return (
+            train_tags_fwd,
+            other_tags_fwd,
+            [None] * len(train_sentences),
+            empty_super,
+            train_upos,
+            other_upos_lists,
+        )
 
-    # ----- first-pass backward (Right-to-Left) tagger -----
+    # ----- 2. First-pass backward (Right-to-Left) tagger -----
     print("Training the first-pass R-to-L tagger (jackknifing for training data)...")
     train_tags_bwd = jackknife_tags(
-        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, direction="right-to-left"
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        JACKKNIFE_FOLDS,
+        direction="right-to-left",
+        upos_tags_list=train_upos,
     )
     print("    R-to-L tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_bwd))
 
     print("Training the first-pass R-to-L tagger on all training sentences...")
-    tagger_bwd = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, direction="right-to-left")
+    tagger_bwd = train_tagger(
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        direction="right-to-left",
+        upos_tags_list=train_upos,
+    )
     other_tags_bwd = []
-    for sentences in other_sentence_lists:
-        tags_list = [tagger_bwd.tag(sentence["words"]) for sentence in sentences]
+    for j in range(len(other_sentence_lists)):
+        sentences = other_sentence_lists[j]
+        tags_list = [
+            tagger_bwd.tag(sentences[k]["words"], upos_tags=other_upos_lists[j][k])
+            for k in range(len(sentences))
+        ]
         other_tags_bwd.append(tags_list)
     tagger_bwd = None
     gc.collect()
 
-    # ----- second pass: stacked bidirectional tagger with global lookahead -----
+    # ----- 3. Second pass: stacked bidirectional tagger with global lookahead -----
     print("Training the second-pass bidirectional tagger (jackknifing)...")
     train_tags_2 = jackknife_tags(
         tag_sentences,
@@ -155,6 +219,7 @@ def make_tags(train_sentences, other_sentence_lists):
         first_tags_list=train_tags_fwd,
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
+        upos_tags_list=train_upos,
     )
     print("    second-pass tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_2))
 
@@ -166,6 +231,7 @@ def make_tags(train_sentences, other_sentence_lists):
         first_tags_list=train_tags_fwd,
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
+        upos_tags_list=train_upos,
     )
     other_tags_lists_2 = []
     for j in range(len(other_sentence_lists)):
@@ -175,6 +241,7 @@ def make_tags(train_sentences, other_sentence_lists):
                 sentences[k]["words"],
                 first_tags=other_tags_fwd[j][k],
                 backward_tags=other_tags_bwd[j][k],
+                upos_tags=other_upos_lists[j][k],
             )
             for k in range(len(sentences))
         ]
@@ -182,7 +249,7 @@ def make_tags(train_sentences, other_sentence_lists):
     tagger_2 = None
     gc.collect()
 
-    # ----- supertagger: relative head-offset + head coarse group -----
+    # ----- 4. Supertagger: relative head-offset + head coarse group -----
     super_sentences = make_supertag_targets(train_sentences)
     super_names = get_label_names(super_sentences)
     print("Training the head-offset supertagger (jackknifing)...")
@@ -194,6 +261,7 @@ def make_tags(train_sentences, other_sentence_lists):
         first_tags_list=train_tags_2,
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
+        upos_tags_list=train_upos,
     )
     print("    supertag accuracy on training data (jackknifed): %.2f" % tag_accuracy(super_sentences, train_supertags))
 
@@ -205,6 +273,7 @@ def make_tags(train_sentences, other_sentence_lists):
         first_tags_list=train_tags_2,
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
+        upos_tags_list=train_upos,
     )
     other_super_lists = []
     for j in range(len(other_sentence_lists)):
@@ -214,6 +283,7 @@ def make_tags(train_sentences, other_sentence_lists):
                 sentences[k]["words"],
                 first_tags=other_tags_lists_2[j][k],
                 backward_tags=other_tags_bwd[j][k],
+                upos_tags=other_upos_lists[j][k],
             )
             for k in range(len(sentences))
         ]
@@ -221,14 +291,31 @@ def make_tags(train_sentences, other_sentence_lists):
     super_tagger = None
     gc.collect()
 
-    return train_tags_2, other_tags_lists_2, train_supertags, other_super_lists
+    return (
+        train_tags_2,
+        other_tags_lists_2,
+        train_supertags,
+        other_super_lists,
+        train_upos,
+        other_upos_lists,
+    )
 
 
-def make_mst_guides(train_sentences, train_tags, train_supertags, other_sentence_lists, other_tags_lists, other_super_lists, lexicon_ltr):
+def make_mst_guides(
+    train_sentences,
+    train_tags,
+    train_supertags,
+    train_upos,
+    other_sentence_lists,
+    other_tags_lists,
+    other_super_lists,
+    other_upos_lists,
+    lexicon_ltr,
+):
     """
     Train the Global First-Order Graph-Based MST Structured Perceptron:
       - 5-fold jackknifing on `train_sentences` for zero-leakage stacking
-      - full training on all `train_sentences` for `other_sentence_lists`
+      - 2-seed ensemble trained on all `train_sentences` for `other_sentence_lists`
     """
     if not USE_SECOND_PASS_TAGGER:
         empty_other = [[None] * len(s) for s in other_sentence_lists]
@@ -239,6 +326,7 @@ def make_mst_guides(train_sentences, train_tags, train_supertags, other_sentence
         train_sentences,
         train_tags,
         train_supertags,
+        upos_list=train_upos,
         epochs=MST_EPOCHS,
         n_folds=JACKKNIFE_FOLDS,
     )
@@ -247,24 +335,34 @@ def make_mst_guides(train_sentences, train_tags, train_supertags, other_sentence
     mst_uas, _ = accuracy(train_sentences, mst_train_heads, dummy_labels)
     print("    global Graph-MST UAS on training data (jackknifed): %.2f" % mst_uas)
 
-    print("Training the global Graph-MST parser on all training sentences...")
-    mst_model = GraphMSTParser(lexicon=lexicon_ltr)
-    mst_model.train(train_sentences, train_tags, train_supertags, epochs=MST_EPOCHS, seed=1)
+    print("Training the 2-seed global Graph-MST parser on all training sentences...")
+    mst_model_1 = GraphMSTParser(lexicon=lexicon_ltr)
+    mst_model_1.train(
+        train_sentences, train_tags, train_supertags, train_upos, epochs=MST_EPOCHS, seed=1
+    )
+    mst_model_2 = GraphMSTParser(lexicon=lexicon_ltr)
+    mst_model_2.train(
+        train_sentences, train_tags, train_supertags, train_upos, epochs=MST_EPOCHS, seed=2
+    )
     other_mst_lists = []
     for j in range(len(other_sentence_lists)):
         sentences = other_sentence_lists[j]
         t_list = other_tags_lists[j]
         s_list = other_super_lists[j]
+        u_list = other_upos_lists[j]
         m_list = [
-            mst_model.predict_mst_info(
+            mst_model_1.predict_mst_info(
                 sentences[k]["words"],
                 t_list[k],
                 s_list[k] if s_list is not None else None,
+                u_list[k] if u_list is not None else None,
+                second_model=mst_model_2,
             )
             for k in range(len(sentences))
         ]
         other_mst_lists.append(m_list)
-    mst_model = None
+    mst_model_1 = None
+    mst_model_2 = None
     gc.collect()
     return train_mst, other_mst_lists
 
@@ -330,19 +428,22 @@ def train_one_parser(
     train_tags,
     train_supertags,
     train_mst,
+    train_upos,
     sentence_lists,
     tags_lists,
     supertags_lists,
     mst_lists,
+    upos_lists,
     lexicon_ltr=None,
     lexicon_rtl=None,
 ):
-    """Train one parser (Arc-Hybrid or Arc-Eager) and return its (heads, labels, margins)."""
+    """Train one parser (Arc-Hybrid, Arc-Eager, or Arc-Standard) and return its (heads, labels, margins)."""
     if direction == "right-to-left":
         sentences_for_training = []
         tags_for_training = []
         super_for_training = []
         mst_for_training = []
+        upos_for_training = []
         for k in range(len(train_sentences)):
             sentences_for_training.append(flip_sentence(train_sentences[k]))
             tags_for_training.append(flip_tags(train_tags[k]))
@@ -352,16 +453,22 @@ def train_one_parser(
             mst_for_training.append(
                 flip_mst_info(train_mst[k]) if train_mst[k] is not None else None
             )
+            upos_for_training.append(
+                flip_list(train_upos[k]) if train_upos is not None and train_upos[k] is not None else None
+            )
         lexicon = lexicon_rtl
     else:
         sentences_for_training = train_sentences
         tags_for_training = train_tags
         super_for_training = train_supertags
         mst_for_training = train_mst
+        upos_for_training = train_upos
         lexicon = lexicon_ltr
 
     if system_type == "arc-eager":
         parser = ArcEagerParser(label_names, lexicon=lexicon)
+    elif system_type == "arc-standard":
+        parser = ArcStandardParser(label_names, lexicon=lexicon)
     else:
         parser = Parser(label_names, lexicon=lexicon)
 
@@ -373,6 +480,7 @@ def train_one_parser(
             random_generator,
             super_for_training,
             mst_for_training,
+            upos_for_training,
             epoch=epoch,
         )
         print("    epoch", epoch + 1, "of", PARSER_EPOCHS, "done")
@@ -384,24 +492,27 @@ def train_one_parser(
         tags_list = tags_lists[j]
         super_list = supertags_lists[j]
         mst_list = mst_lists[j]
+        u_list = upos_lists[j] if upos_lists is not None else None
         all_heads = []
         all_labels = []
         all_margins = []
         for k in range(len(sentences)):
             stags = super_list[k] if super_list is not None else None
             minfo = mst_list[k] if mst_list is not None else None
+            utags = u_list[k] if u_list is not None else None
             if direction == "right-to-left":
                 flipped = flip_sentence(sentences[k])
                 f_tags = flip_tags(tags_list[k])
                 f_stags = flip_supertags(stags) if stags is not None else None
                 f_minfo = flip_mst_info(minfo) if minfo is not None else None
+                f_utags = flip_list(utags) if utags is not None else None
                 heads, labels, margins = parser.parse(
-                    flipped["words"], f_tags, False, f_stags, f_minfo
+                    flipped["words"], f_tags, False, f_stags, f_minfo, f_utags
                 )
                 heads, labels, margins = flip_result(heads, labels, margins)
             else:
                 heads, labels, margins = parser.parse(
-                    sentences[k]["words"], tags_list[k], False, stags, minfo
+                    sentences[k]["words"], tags_list[k], False, stags, minfo, utags
                 )
             all_heads.append(heads)
             all_labels.append(labels)
@@ -410,7 +521,7 @@ def train_one_parser(
     return results
 
 
-def _refine_ud_tree(words, heads, labels):
+def _refine_ud_tree(words, heads, labels, upos=None):
     """
     Apply deterministic Universal Dependencies v2 structural consistency rules
     to the globally decoded parse tree.
@@ -439,13 +550,27 @@ def _refine_ud_tree(words, heads, labels):
         if 0 <= h <= n:
             children[h].append(i)
 
-    # 3. Prepositional/possessive phrase (`case` child) `obl` vs `nmod` / `nmod:poss`
+    # 3. Passive subject consistency (`aux:pass` child on predicate -> `nsubj:pass`)
+    for h in range(1, n + 1):
+        has_aux_pass = any(labels[ch] == "aux:pass" for ch in children[h])
+        has_cop_or_obj = any(labels[ch] in ("cop", "obj") for ch in children[h])
+        if has_aux_pass and not has_cop_or_obj:
+            for ch in children[h]:
+                if ch < h and labels[ch] == "nsubj":
+                    labels[ch] = "nsubj:pass"
+
+    # 4. Prepositional/possessive phrase (`case` child) `obl` <-> `nmod` / `nmod:poss`
     nominal_head_labels = {
         "obj", "iobj", "nsubj", "nsubj:pass",
-        "nmod", "nmod:poss", "compound", "appos",
+        "nmod", "nmod:poss", "nmod:tmod", "nmod:npmod",
+        "obl", "obl:tmod", "obl:npmod",
+        "compound", "appos", "vocative", "flat",
     }
     clausal_child_labels = {
         "cop", "aux", "aux:pass", "nsubj", "nsubj:pass", "csubj", "expl",
+    }
+    nominal_child_labels = {
+        "det", "det:predet", "amod", "nmod:poss",
     }
 
     for i in range(1, n + 1):
@@ -461,10 +586,26 @@ def _refine_ud_tree(words, heads, labels):
             continue
 
         h = heads[i]
-        if labels[i] == "obl" and 1 <= h <= n and labels[h] in nominal_head_labels:
-            head_is_predicate = any(labels[ch] in clausal_child_labels for ch in children[h])
-            if not head_is_predicate:
+        if not (1 <= h <= n):
+            continue
+
+        head_is_predicate = any(labels[ch] in clausal_child_labels for ch in children[h])
+        head_has_nom_mod = any(labels[ch] in nominal_child_labels for ch in children[h])
+        hu = upos[h] if upos is not None else "NOUN"
+
+        if labels[i] == "obl":
+            if labels[h] in nominal_head_labels and not head_is_predicate and not hu.startswith("VERB"):
                 labels[i] = "nmod"
+            elif hu in ("NOUN", "PROPN", "PRON", "NUM") and labels[h] == "conj" and not head_is_predicate:
+                labels[i] = "nmod"
+        elif labels[i] == "nmod" and not has_poss_case:
+            if (
+                hu.startswith("VERB")
+                and labels[h] in ("root", "conj", "advcl", "ccomp", "xcomp", "parataxis")
+                and not head_has_nom_mod
+                and not any(labels[ch] == "cop" for ch in children[h])
+            ):
+                labels[i] = "obl"
 
     return heads, labels
 
@@ -476,12 +617,13 @@ def vote(
     tags_list=None,
     supertags_list=None,
     mst_list=None,
+    upos_list=None,
     tree_labeler=None,
 ):
     """
     Combine all parsers via:
       1. Margin-confidence-weighted arc score matrix construction (combining all
-         transition parsers + the Global Graph-MST parser).
+         12 transition parsers across 3 transition systems + 2-seed Global Graph-MST).
       2. Exact single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding.
       3. Full-tree 2nd/3rd-order label scoring (`FullTreeLabeler`) blended with
          the transition ensemble's confidence-weighted label votes.
@@ -527,32 +669,38 @@ def vote(
                 if 0 <= h <= n and h != i:
                     marg = all_margins[k][i] if all_margins is not None else 4.0
                     conf_mult = 0.85 + 0.30 * (min(max(marg, 0.0), 12.0) / 12.0)
-                    # Small deterministic tie-break favoring earlier parsers
                     arc_scores[h, i] += w_p * conf_mult - 1.0e-5 * p_idx
 
-        # Add Global Graph-MST structural votes when available
+        # Add 2-seed Global Graph-MST structural votes when available
         if mst_list is not None and mst_list[k] is not None:
             minfo = mst_list[k]
             mh1 = minfo["heads"]
             mh2 = minfo["heads2"]
+            mh3 = minfo.get("heads3")
             mconf = minfo["conf"]
             for i in range(1, n + 1):
                 h1 = mh1[i]
                 h2 = mh2[i]
+                h3 = mh3[i] if mh3 is not None else -1
                 if 0 <= h1 <= n and h1 != i:
-                    bonus = 0.95 if mconf[i] == "HIGH" else (0.65 if mconf[i] == "MID" else 0.40)
+                    bonus = 1.05 if mconf[i] == "HIGH" else (0.72 if mconf[i] == "MID" else 0.45)
                     arc_scores[h1, i] += bonus
                 if 0 <= h2 <= n and h2 != i:
-                    arc_scores[h2, i] += 0.20
+                    arc_scores[h2, i] += 0.22
+                if 0 <= h3 <= n and h3 != i:
+                    arc_scores[h3, i] += 0.08
 
         # Decode exact single-root Maximum Spanning Arborescence via Chu-Liu/Edmonds
         heads = chu_liu_edmonds(arc_scores)
 
         # Compute full-tree label scores when `tree_labeler` is available
         tree_scores = None
+        utags = upos_list[k] if upos_list is not None else None
         if tree_labeler is not None and tags_list is not None:
             stags = supertags_list[k] if supertags_list is not None else None
-            tree_scores = tree_labeler.score_sentence_labels(words, tags_list[k], stags, heads)
+            tree_scores = tree_labeler.score_sentence_labels(
+                words, tags_list[k], stags, heads, upos=utags
+            )
 
         labels = [""] * (n + 1)
         for i in range(1, n + 1):
@@ -588,7 +736,7 @@ def vote(
                     for lab, ts in t_map.items():
                         diff = ts - max_ts
                         if diff >= -8.0:
-                            bonus = 1.15 * math.exp(0.25 * diff)
+                            bonus = 1.25 * math.exp(0.25 * diff)
                             label_votes[lab] = label_votes.get(lab, 0.0) + bonus
                             if lab not in first_seen:
                                 first_seen[lab] = len(predictions)
@@ -602,7 +750,7 @@ def vote(
                 best_lab = "dep"
             labels[i] = best_lab
 
-        heads, labels = _refine_ud_tree(words, heads, labels)
+        heads, labels = _refine_ud_tree(words, heads, labels, upos=utags)
         voted_heads.append(heads)
         voted_labels.append(labels)
 
@@ -621,11 +769,18 @@ def check_mode(all_train):
     print("Training sentences:", len(train_sentences), " check sentences:", len(dev_sentences))
 
     label_names = get_label_names(all_train)
-    train_tags, other_tags, train_supertags, other_supertags = make_tags(
-        train_sentences, [dev_sentences]
-    )
+    (
+        train_tags,
+        other_tags,
+        train_supertags,
+        other_supertags,
+        train_upos,
+        other_upos,
+    ) = make_tags(train_sentences, [dev_sentences])
     dev_tags = other_tags[0]
     dev_supertags = other_supertags[0]
+    dev_upos = other_upos[0]
+    print("    UPOS accuracy on check data: %.2f" % tag_accuracy(make_upos_targets(dev_sentences), dev_upos))
     print("    tag accuracy on check data: %.2f" % tag_accuracy(make_tag_targets(dev_sentences), dev_tags))
     if USE_SECOND_PASS_TAGGER:
         print("    supertag accuracy on check data: %.2f" % tag_accuracy(make_supertag_targets(dev_sentences), dev_supertags))
@@ -641,9 +796,11 @@ def check_mode(all_train):
         train_sentences,
         train_tags,
         train_supertags,
+        train_upos,
         [dev_sentences],
         [dev_tags],
         [dev_supertags],
+        [dev_upos],
         lexicon_ltr,
     )
     dev_mst = other_mst[0]
@@ -651,7 +808,7 @@ def check_mode(all_train):
         dev_mst_heads = [m["heads"] for m in dev_mst]
         dummy_labels = [["root"] * len(s["words"]) for s in dev_sentences]
         mst_dev_uas, _ = accuracy(dev_sentences, dev_mst_heads, dummy_labels)
-        print("    global Graph-MST UAS on check data: %.2f" % mst_dev_uas)
+        print("    2-seed global Graph-MST UAS on check data: %.2f" % mst_dev_uas)
 
     tree_labeler = None
     if USE_SECOND_PASS_TAGGER:
@@ -662,6 +819,7 @@ def check_mode(all_train):
             train_tags,
             train_supertags,
             train_mst,
+            train_upos,
             epochs=TREE_LABELER_EPOCHS,
             seed=1,
         )
@@ -682,10 +840,12 @@ def check_mode(all_train):
             train_tags,
             train_supertags,
             train_mst,
+            train_upos,
             [dev_sentences],
             [dev_tags],
             [dev_supertags],
             [dev_mst],
+            [dev_upos],
             lexicon_ltr=lexicon_ltr,
             lexicon_rtl=lexicon_rtl,
         )
@@ -701,6 +861,7 @@ def check_mode(all_train):
             tags_list=dev_tags,
             supertags_list=dev_supertags,
             mst_list=dev_mst,
+            upos_list=dev_upos,
             tree_labeler=tree_labeler,
         )
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
@@ -718,11 +879,17 @@ def final_mode(train_sentences):
     print("Training sentences:", len(train_sentences), " test sentences:", len(test_sentences))
 
     label_names = get_label_names(train_sentences)
-    train_tags, other_tags, train_supertags, other_supertags = make_tags(
-        train_sentences, [test_sentences]
-    )
+    (
+        train_tags,
+        other_tags,
+        train_supertags,
+        other_supertags,
+        train_upos,
+        other_upos,
+    ) = make_tags(train_sentences, [test_sentences])
     test_tags = other_tags[0]
     test_supertags = other_supertags[0]
+    test_upos = other_upos[0]
 
     tag_Target_ltr = make_tag_targets(train_sentences)
     lexicon_ltr = build_lexicon(tag_Target_ltr)
@@ -735,9 +902,11 @@ def final_mode(train_sentences):
         train_sentences,
         train_tags,
         train_supertags,
+        train_upos,
         [test_sentences],
         [test_tags],
         [test_supertags],
+        [test_upos],
         lexicon_ltr,
     )
     test_mst = other_mst[0]
@@ -751,6 +920,7 @@ def final_mode(train_sentences):
             train_tags,
             train_supertags,
             train_mst,
+            train_upos,
             epochs=TREE_LABELER_EPOCHS,
             seed=1,
         )
@@ -771,10 +941,12 @@ def final_mode(train_sentences):
             train_tags,
             train_supertags,
             train_mst,
+            train_upos,
             [test_sentences],
             [test_tags],
             [test_supertags],
             [test_mst],
+            [test_upos],
             lexicon_ltr=lexicon_ltr,
             lexicon_rtl=lexicon_rtl,
         )
@@ -789,6 +961,7 @@ def final_mode(train_sentences):
         tags_list=test_tags,
         supertags_list=test_supertags,
         mst_list=test_mst,
+        upos_list=test_upos,
         tree_labeler=tree_labeler,
     )
     if COPY_KNOWN_SENTENCES:

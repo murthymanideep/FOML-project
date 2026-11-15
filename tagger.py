@@ -1,14 +1,15 @@
 """
 Sequence taggers for predicting each word's:
+  0. Intrinsic Syntactic Word Class (`upos`, 19 UD-derived POS categories induced
+     strictly from the gold dependency trees in `train.csv`)
   1. Fine-grained relation + attachment direction (`tag`, e.g. "nsubj>", "obl<", "root")
   2. Relative head-offset + head coarse category (`supertag`, e.g. "+1:OBJ", "-2:CLAUSE", "ROOT:ROOT")
 
 Uses:
   - Fold-specific empirical word/stem/signature priors (`build_lexicon`)
     computed strictly inside each jackknife training fold to prevent leakage.
-  - Bidirectional Pass-1 tagging (Left-to-Right and Right-to-Left) with
-    global sentence-level clause/root/nominal offset lookahead in Pass-2 and
-    Supertagging.
+  - Induced POS (`upos`) sequence tagging followed by Bidirectional Pass-1/Pass-2
+    dependency tagging and global sentence-level clause/verb/root/nominal lookahead.
   - Margin-infused structured perceptron updates with scheduled exploration.
 """
 
@@ -19,17 +20,160 @@ from data_utils import (
     stem_word,
     word_shape,
     word_signature,
+    base_label,
     coarse_group,
     tag_direction,
     head_offset_bucket,
+    is_punct_word,
     build_lexicon,
     lookup_word_priors,
+    PRONOUN_WORDS,
+    POSSESSIVE_PRONOUNS,
 )
 from perceptron import AveragedPerceptron
 
 
 START = "<START>"
 END = "<END>"
+
+
+def make_upos_targets(sentences):
+    """
+    Induce each token's intrinsic Universal Part-of-Speech / Syntactic Category
+    (`upos`, 19 classes) strictly from the gold dependency structures in `sentences`.
+    Distinguishes true finite/non-finite verbs (`VERB`, `VERB_VBG`, `VERB_VBN`,
+    `VERB_INF`) from copular predicate adjectives (`ADJ`) and predicate nouns (`NOUN`).
+    """
+    # Pass 1: collect non-clausal dominant base labels per normalized word
+    nonclause_counts = {}
+    clausal_roles = {"root", "conj", "ccomp", "xcomp", "advcl", "acl", "parataxis", "csubj"}
+    for s in sentences:
+        words = s["words"]
+        labels = s["labels"]
+        for i in range(1, len(words)):
+            b = base_label(labels[i])
+            if b not in clausal_roles:
+                nw = normalize_word(words[i])
+                cmap = nonclause_counts.get(nw)
+                if cmap is None:
+                    cmap = {}
+                    nonclause_counts[nw] = cmap
+                cmap[b] = cmap.get(b, 0) + 1
+
+    nonclause_dom = {}
+    for nw, cmap in nonclause_counts.items():
+        nonclause_dom[nw] = max(cmap.items(), key=lambda kv: kv[1])[0]
+
+    upos_sentences = []
+    for s in sentences:
+        words = s["words"]
+        heads = s["heads"]
+        labels = s["labels"]
+        n = len(words) - 1
+
+        children = [[] for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            h = heads[i]
+            if 0 <= h <= n:
+                children[h].append(i)
+
+        utags = [words[0]]
+        for i in range(1, n + 1):
+            w = words[i]
+            nw = normalize_word(w)
+            lab = labels[i]
+            b_lab = base_label(lab)
+            sig = word_signature(w, i)
+            c_list = children[i]
+
+            has_cop = any(base_label(labels[c]) == "cop" for c in c_list)
+            has_aux = any(base_label(labels[c]) == "aux" for c in c_list)
+            has_pass = any("pass" in labels[c] for c in c_list)
+            has_det = any(base_label(labels[c]) == "det" or labels[c] == "nmod:poss" for c in c_list)
+            has_amod = any(base_label(labels[c]) == "amod" for c in c_list)
+            has_obj = any(base_label(labels[c]) in ("obj", "iobj") for c in c_list)
+            has_flat = any(base_label(labels[c]) == "flat" for c in c_list)
+            has_to_mark = any(
+                base_label(labels[c]) == "mark" and normalize_word(words[c]) == "to"
+                for c in c_list
+            )
+
+            if b_lab == "punct" or is_punct_word(w):
+                u = "PUNCT"
+            elif b_lab == "det":
+                u = "DET"
+            elif b_lab == "cc":
+                u = "CCONJ"
+            elif b_lab == "cop":
+                u = "COP"
+            elif b_lab == "aux":
+                u = "AUX"
+            elif b_lab == "nummod" or nw in ("<NUMBER>", "<YEAR>", "<PERCENT>", "<MONEY>", "<TIME>"):
+                u = "NUM"
+            elif b_lab == "discourse":
+                u = "INTJ"
+            elif b_lab == "expl":
+                u = "PRON"
+            elif b_lab == "case":
+                u = "PART" if nw in ("'s", "'") else "ADP"
+            elif b_lab == "mark":
+                u = "PART" if nw == "to" else "SCONJ"
+            elif b_lab == "advmod":
+                u = "PART" if nw in ("not", "n't", "nt") else "ADV"
+            elif b_lab == "amod" or nw == "<ORDINAL>":
+                u = "ADJ"
+            elif b_lab == "flat":
+                u = "PROPN"
+            elif b_lab not in clausal_roles and not has_aux and not has_obj:
+                if nw in PRONOUN_WORDS or (lab == "nmod:poss" and nw in POSSESSIVE_PRONOUNS):
+                    u = "PRON"
+                elif has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
+                    u = "PROPN"
+                elif nonclause_dom.get(nw) == "amod" and not has_det:
+                    u = "ADJ"
+                else:
+                    u = "NOUN"
+            else:
+                # Clausal / predicate position
+                nc_dom = nonclause_dom.get(nw)
+                if has_cop:
+                    if has_det or has_amod or nc_dom in ("nsubj", "obj", "obl", "nmod", "compound"):
+                        if has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
+                            u = "PROPN"
+                        elif nw in PRONOUN_WORDS:
+                            u = "PRON"
+                        else:
+                            u = "NOUN"
+                    else:
+                        u = "ADJ"
+                elif not has_aux and not has_obj and (has_det or has_amod or has_flat):
+                    u = "PROPN" if (has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN"))) else "NOUN"
+                elif not has_aux and not has_obj and b_lab == "conj":
+                    if nc_dom == "amod" or sig.endswith(("ADJ_ABLE", "ADJ_OUS", "ADJ_AL", "ADJ_IVE", "ADJ_IC", "ADJ_FUL", "ADJ_LESS")):
+                        u = "ADJ"
+                    elif nc_dom in ("nsubj", "obj", "obl", "nmod", "compound") or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
+                        u = "PROPN" if sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")) else "NOUN"
+                    else:
+                        u = "VERB"
+                else:
+                    if has_pass or (has_aux and sig.endswith(("VERB_ED", "VERB_EN"))):
+                        u = "VERB_VBN"
+                    elif nw.endswith("ing") and len(nw) > 4:
+                        u = "VERB_VBG"
+                    elif has_to_mark or b_lab == "xcomp":
+                        u = "VERB_INF"
+                    else:
+                        u = "VERB"
+            utags.append(u)
+
+        new_s = {
+            "name": s["name"],
+            "words": words,
+            "heads": heads,
+            "labels": utags,
+        }
+        upos_sentences.append(new_s)
+    return upos_sentences
 
 
 def make_word_tag(sentence, index):
@@ -97,17 +241,16 @@ def tag_accuracy(tag_sentences, predicted_tags):
     return 100.0 * correct / total
 
 
-def _prepare_global_tag_context(first_tags, backward_tags=None):
+def _prepare_global_tag_context(first_tags, backward_tags=None, upos_tags=None):
     """
-    Precompute whole-sentence structural lookahead from Pass-1 tags:
+    Precompute whole-sentence structural lookahead from Pass-1 tags & UPOS:
       - relative offset from token i to the nearest predicted `root`
-      - relative offset from token i to nearest left/right `CLAUSE`
-      - relative offset from token i to nearest left/right `NOMINAL` (`SUBJ`/`OBJ`/`NMOD`)
+      - relative offset from token i to nearest left/right `CLAUSE` or `VERB`
+      - relative offset from token i to nearest left/right `NOMINAL` (`NOUN`/`PROPN`/`PRON`)
     """
     n = len(first_tags) - 1
     c_tags = [coarse_group(t) for t in first_tags]
 
-    # Locate predicted roots
     roots = [i for i in range(1, n + 1) if first_tags[i] == "root"]
     if not roots and backward_tags is not None:
         roots = [i for i in range(1, n + 1) if backward_tags[i] == "root"]
@@ -119,9 +262,10 @@ def _prepare_global_tag_context(first_tags, backward_tags=None):
     for i in range(1, n + 1):
         left_cl[i] = last_cl
         left_nom[i] = last_nom
-        if c_tags[i] == "CLAUSE" or first_tags[i] == "root":
+        u_i = upos_tags[i] if upos_tags is not None else ""
+        if c_tags[i] == "CLAUSE" or first_tags[i] == "root" or u_i.startswith("VERB"):
             last_cl = i
-        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP"):
+        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP") or u_i in ("NOUN", "PROPN", "PRON"):
             last_nom = i
 
     right_cl = [0] * (n + 1)
@@ -131,9 +275,10 @@ def _prepare_global_tag_context(first_tags, backward_tags=None):
     for i in range(n, 0, -1):
         right_cl[i] = next_cl
         right_nom[i] = next_nom
-        if c_tags[i] == "CLAUSE" or first_tags[i] == "root":
+        u_i = upos_tags[i] if upos_tags is not None else ""
+        if c_tags[i] == "CLAUSE" or first_tags[i] == "root" or u_i.startswith("VERB"):
             next_cl = i
-        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP"):
+        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP") or u_i in ("NOUN", "PROPN", "PRON"):
             next_nom = i
 
     off_root = ["NONE"] * (n + 1)
@@ -156,6 +301,53 @@ def _prepare_global_tag_context(first_tags, backward_tags=None):
             off_r_nom[i] = head_offset_bucket(i, right_nom[i]) + ":" + c_tags[right_nom[i]]
 
     return (off_root, off_l_cl, off_r_cl, off_l_nom, off_r_nom, str(min(len(roots), 3)))
+
+
+def _prepare_upos_sentence_context(upos_tags):
+    """
+    Precompute global verb/copula/noun lookahead from `upos_tags` so even
+    Pass-1 dependency taggers know whether a finite verb or copula lies
+    to the left or right of token i.
+    """
+    n = len(upos_tags) - 1
+    left_v = [0] * (n + 1)
+    right_v = [0] * (n + 1)
+    left_n = [0] * (n + 1)
+    right_n = [0] * (n + 1)
+
+    lv = 0
+    ln = 0
+    for i in range(1, n + 1):
+        left_v[i] = lv
+        left_n[i] = ln
+        u = upos_tags[i]
+        if u in ("VERB", "COP", "VERB_VBN", "VERB_VBG", "VERB_INF"):
+            lv = i
+        if u in ("NOUN", "PROPN", "PRON"):
+            ln = i
+
+    rv = 0
+    rn = 0
+    for i in range(n, 0, -1):
+        right_v[i] = rv
+        right_n[i] = rn
+        u = upos_tags[i]
+        if u in ("VERB", "COP", "VERB_VBN", "VERB_VBG", "VERB_INF"):
+            rv = i
+        if u in ("NOUN", "PROPN", "PRON"):
+            rn = i
+
+    v_l_off = ["NONE"] * (n + 1)
+    v_r_off = ["NONE"] * (n + 1)
+    n_r_off = ["NONE"] * (n + 1)
+    for i in range(1, n + 1):
+        if left_v[i] > 0:
+            v_l_off[i] = head_offset_bucket(i, left_v[i]) + ":" + upos_tags[left_v[i]]
+        if right_v[i] > 0:
+            v_r_off[i] = head_offset_bucket(i, right_v[i]) + ":" + upos_tags[right_v[i]]
+        if right_n[i] > 0:
+            n_r_off[i] = head_offset_bucket(i, right_n[i]) + ":" + upos_tags[right_n[i]]
+    return (v_l_off, v_r_off, n_r_off)
 
 
 class Tagger:
@@ -196,6 +388,8 @@ class Tagger:
         first_tags=None,
         backward_tags=None,
         global_ctx=None,
+        upos_tags=None,
+        upos_ctx=None,
     ):
         n = len(words) - 1
         word = words[i]
@@ -348,6 +542,35 @@ class Tagger:
             "pos=" + str(min(i, 5)) + "+" + str(min(n - i, 5)),
         ]
 
+        # Induced POS (`upos`) features
+        if upos_tags is not None:
+            u0 = upos_tags[i]
+            u_l1 = upos_tags[i - 1] if i - 1 >= 1 else START
+            u_l2 = upos_tags[i - 2] if i - 2 >= 1 else START
+            u_r1 = upos_tags[i + 1] if i + 1 <= n else END
+            u_r2 = upos_tags[i + 2] if i + 2 <= n else END
+            u_r3 = upos_tags[i + 3] if i + 3 <= n else END
+            v_l_off, v_r_off, n_r_off = upos_ctx
+
+            features.extend([
+                "u0=" + u0,
+                "u-1=" + u_l1,
+                "u-2=" + u_l2,
+                "u+1=" + u_r1,
+                "u+2=" + u_r2,
+                "u+3=" + u_r3,
+                "u0+w=" + u0 + "+" + normal,
+                "u-1+u0+u+1=" + u_l1 + "+" + u0 + "+" + u_r1,
+                "u0+u+1+u+2=" + u0 + "+" + u_r1 + "+" + u_r2,
+                "u-2+u-1+u0=" + u_l2 + "+" + u_l1 + "+" + u0,
+                "u+1+u+2+u+3=" + u_r1 + "+" + u_r2 + "+" + u_r3,
+                "t-1+u0+u+1=" + previous_tag + "+" + u0 + "+" + u_r1,
+                "u0+v_l=" + u0 + "+" + v_l_off[i],
+                "u0+v_r=" + u0 + "+" + v_r_off[i],
+                "u0+n_r=" + u0 + "+" + n_r_off[i],
+                "u_span=" + v_l_off[i] + "+" + u0 + "+" + v_r_off[i],
+            ])
+
         if first_tags is not None:
             p0 = first_tags[i]
             p_l1 = first_tags[i - 1] if i - 1 >= 1 else START
@@ -430,17 +653,26 @@ class Tagger:
                 ])
         return features
 
-    def tag(self, words, correct_tags=None, first_tags=None, rng=None, backward_tags=None):
+    def tag(
+        self,
+        words,
+        correct_tags=None,
+        first_tags=None,
+        rng=None,
+        backward_tags=None,
+        upos_tags=None,
+    ):
         """
         Tag one sentence. Returns a list of tags, with "<ROOT>" at position 0.
         Supports both left-to-right and right-to-left decoding.
         """
         normal_words, stems, shapes, sigs, priors = self._prepare_sentence(words)
         global_ctx = (
-            _prepare_global_tag_context(first_tags, backward_tags)
+            _prepare_global_tag_context(first_tags, backward_tags, upos_tags)
             if first_tags is not None
             else None
         )
+        upos_ctx = _prepare_upos_sentence_context(upos_tags) if upos_tags is not None else None
         n = len(words) - 1
         tags = [None] * (n + 1)
         tags[0] = words[0]
@@ -468,6 +700,8 @@ class Tagger:
                 first_tags,
                 backward_tags,
                 global_ctx,
+                upos_tags,
+                upos_ctx,
             )
             rows = self.model.feature_rows(features)
             scores = self.model.scores(rows)
@@ -493,7 +727,15 @@ class Tagger:
             previous_tag = guessed_tag
         return tags
 
-    def train(self, sentences, epochs, seed=1, first_tags_list=None, backward_tags_list=None):
+    def train(
+        self,
+        sentences,
+        epochs,
+        seed=1,
+        first_tags_list=None,
+        backward_tags_list=None,
+        upos_tags_list=None,
+    ):
         """
         Train on sentences; the "labels" of the sentence are the tags to learn.
         """
@@ -505,12 +747,14 @@ class Tagger:
                 sentence = sentences[k]
                 first_tags = first_tags_list[k] if first_tags_list is not None else None
                 bwd_tags = backward_tags_list[k] if backward_tags_list is not None else None
+                utags = upos_tags_list[k] if upos_tags_list is not None else None
                 self.tag(
                     sentence["words"],
                     sentence["labels"],
                     first_tags,
                     random_generator,
                     bwd_tags,
+                    utags,
                 )
                 self.model.next_step()
         self.model.average_weights()
@@ -524,11 +768,12 @@ def train_tagger(
     lexicon=None,
     direction="left-to-right",
     backward_tags_list=None,
+    upos_tags_list=None,
 ):
     if lexicon is None:
         lexicon = build_lexicon(sentences)
     tagger = Tagger(tag_names, lexicon=lexicon, direction=direction)
-    tagger.train(sentences, epochs, 1, first_tags_list, backward_tags_list)
+    tagger.train(sentences, epochs, 1, first_tags_list, backward_tags_list, upos_tags_list)
     return tagger
 
 
@@ -540,6 +785,7 @@ def jackknife_tags(
     first_tags_list=None,
     direction="left-to-right",
     backward_tags_list=None,
+    upos_tags_list=None,
 ):
     """
     Give tags to the TRAINING sentences using n_folds cross-validation
@@ -552,6 +798,7 @@ def jackknife_tags(
         train_part = []
         train_part_first_tags = []
         train_part_bwd_tags = []
+        train_part_upos = []
         held_out = []
         for k in range(len(sentences)):
             if k % n_folds == fold:
@@ -562,6 +809,8 @@ def jackknife_tags(
                     train_part_first_tags.append(first_tags_list[k])
                 if backward_tags_list is not None:
                     train_part_bwd_tags.append(backward_tags_list[k])
+                if upos_tags_list is not None:
+                    train_part_upos.append(upos_tags_list[k])
 
         fold_lexicon = build_lexicon(train_part)
         tagger = train_tagger(
@@ -572,14 +821,17 @@ def jackknife_tags(
             lexicon=fold_lexicon,
             direction=direction,
             backward_tags_list=train_part_bwd_tags if backward_tags_list is not None else None,
+            upos_tags_list=train_part_upos if upos_tags_list is not None else None,
         )
         for k in held_out:
             first_tags = first_tags_list[k] if first_tags_list is not None else None
             bwd_tags = backward_tags_list[k] if backward_tags_list is not None else None
+            utags = upos_tags_list[k] if upos_tags_list is not None else None
             all_tags[k] = tagger.tag(
                 sentences[k]["words"],
                 first_tags=first_tags,
                 backward_tags=bwd_tags,
+                upos_tags=utags,
             )
         print("    jackknife fold", fold + 1, "of", n_folds, "done")
     return all_tags

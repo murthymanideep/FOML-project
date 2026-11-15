@@ -28,6 +28,17 @@ PASSIVE_AUX_WORDS = {
 POSSESSIVE_PRONOUNS = {
     "my", "your", "his", "her", "its", "our", "their", "whose", "thy",
 }
+PRONOUN_WORDS = {
+    "i", "you", "he", "she", "it", "we", "they", "me", "him", "us", "them",
+    "myself", "yourself", "himself", "herself", "itself", "ourselves",
+    "yourselves", "themselves", "mine", "yours", "hers", "ours", "theirs",
+    "who", "whom", "whose", "whoever", "whomever", "what", "whatever",
+    "which", "whichever", "someone", "somebody", "something", "anyone",
+    "anybody", "anything", "everyone", "everybody", "everything", "noone",
+    "nobody", "nothing", "one", "ones", "none", "each", "either", "neither",
+    "this", "that", "these", "those", "my", "your", "his", "her", "its",
+    "our", "their", "thy", "thee", "thou",
+}
 RELATIVE_WORDS = {
     "who", "whom", "whose", "which", "that", "where", "when", "why",
     "whoever", "whomever", "whichever", "whatever",
