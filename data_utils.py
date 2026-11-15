@@ -185,10 +185,8 @@ def normalize_word(word):
     """
     if word == ROOT_WORD:
         return word
-    # Empty tokens in this dataset come from stripped single quotes (')
     if word == "":
         return "'"
-    # Normalize repeated quotes ("""" or '') to standard quote
     if all(c in ('"', "'", "`") for c in word):
         return '"'
 
@@ -208,7 +206,6 @@ def normalize_word(word):
         return "<PERCENT>"
     if len(low) >= 2 and low[0] in ("$", "£", "€", "¥") and any(c.isdigit() for c in low[1:]):
         return "<MONEY>"
-    # Pure numbers with optional commas, decimals, slashes, or leading sign
     stripped = low.replace(",", "").replace(".", "").replace("/", "").replace("-", "").replace(":", "")
     if stripped.isdigit() and any(c.isdigit() for c in low):
         if ":" in low and len(low) <= 5:
@@ -219,11 +216,54 @@ def normalize_word(word):
     return low
 
 
+def stem_word(norm_word):
+    """
+    Lightweight rule-based English morphological stemmer for sharing lexical
+    statistics across inflections (e.g. 'argues'/'argued'/'arguing' -> 'argu',
+    'policies' -> 'policy', 'computers' -> 'computer').
+    """
+    if (
+        len(norm_word) <= 3
+        or norm_word[0] == "<"
+        or norm_word in CLOSED_CLASS_WORDS
+        or not norm_word.isalpha()
+    ):
+        return norm_word
+
+    if norm_word.endswith("ies") and len(norm_word) > 4:
+        return norm_word[:-3] + "y"
+    if norm_word.endswith("ied") and len(norm_word) > 4:
+        return norm_word[:-3] + "y"
+    if norm_word.endswith("ing") and len(norm_word) > 5:
+        base = norm_word[:-3]
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        if len(base) >= 3 and base[-1] in "cgv" and not base.endswith(("ck", "ng")):
+            return base + "e"
+        return base
+    if norm_word.endswith("ed") and len(norm_word) > 4 and not norm_word.endswith("eed"):
+        base = norm_word[:-2]
+        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
+            return base[:-1]
+        return base
+    if norm_word.endswith("es") and len(norm_word) > 4:
+        if norm_word.endswith(("ches", "shes", "sses", "zzes", "xes")):
+            return norm_word[:-2]
+        if norm_word.endswith("ves") and len(norm_word) > 4:
+            return norm_word[:-3] + "f"
+    if (
+        norm_word.endswith("s")
+        and len(norm_word) > 3
+        and not norm_word.endswith(("ss", "us", "is", "as", "os"))
+    ):
+        return norm_word[:-1]
+    return norm_word
+
+
 def word_shape(word):
     """
     Describe how a word looks: upper case -> X, lower case -> x, digit -> d,
     other characters stay the same. Repeated symbols are written once.
-    Example: "McDonald's" -> "XxXx'x",  "2026" -> "d",  "U.S." -> "X.X."
     """
     if word == "":
         return "'"
@@ -288,7 +328,6 @@ def word_signature(word, position=1):
 
     is_closed = norm in CLOSED_CLASS_WORDS
 
-    # Capitalization
     if word.isupper() and any(c.isalpha() for c in word):
         cap = "ALL_CAP_CLOSED" if is_closed else "ALL_CAP_PROPN"
     elif word[0].isupper():
@@ -396,13 +435,15 @@ def head_offset_bucket(index, head):
 
 def build_lexicon(sentences):
     """
-    Build an empirical word & morphological signature lexicon from training sentences.
-    Each sentence in `sentences` has `words` and `labels` (the target tags to learn).
-    Also captures left/right neighbor tag context to form distributional clusters.
+    Build an empirical word, stem, & morphological signature lexicon from
+    training sentences. Also captures left/right neighbor tag context to form
+    distributional clusters.
     """
     word_tag_counts = {}
+    stem_tag_counts = {}
     sig_tag_counts = {}
     word_totals = {}
+    stem_totals = {}
     left_context_counts = {}
     right_context_counts = {}
 
@@ -413,6 +454,7 @@ def build_lexicon(sentences):
         norms = [normalize_word(w) for w in words]
         for i in range(1, n + 1):
             w = norms[i]
+            st = stem_word(w)
             t = labels[i]
             word_totals[w] = word_totals.get(w, 0) + 1
             counts = word_tag_counts.get(w)
@@ -420,6 +462,13 @@ def build_lexicon(sentences):
                 counts = {}
                 word_tag_counts[w] = counts
             counts[t] = counts.get(t, 0) + 1
+
+            stem_totals[st] = stem_totals.get(st, 0) + 1
+            st_counts = stem_tag_counts.get(st)
+            if st_counts is None:
+                st_counts = {}
+                stem_tag_counts[st] = st_counts
+            st_counts[t] = st_counts.get(t, 0) + 1
 
             sig = word_signature(words[i], i)
             scounts = sig_tag_counts.get(sig)
@@ -466,6 +515,17 @@ def build_lexicon(sentences):
         best_r = max(rmap.items(), key=lambda kv: kv[1])[0] if rmap else "END"
         context_cluster[w] = best_l + "_" + coarse_group(best_tag) + "_" + best_r
 
+    stem_dominant = {}
+    stem_ambiguity = {}
+    for st, counts in stem_tag_counts.items():
+        total = stem_totals[st]
+        sorted_tags = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        stem_dominant[st] = sorted_tags[0][0]
+        if len(sorted_tags) >= 2 and sorted_tags[1][1] >= 0.15 * total:
+            stem_ambiguity[st] = sorted_tags[0][0] + "/" + sorted_tags[1][0]
+        else:
+            stem_ambiguity[st] = sorted_tags[0][0]
+
     sig_dominant = {}
     sig_ambiguity = {}
     for sig, counts in sig_tag_counts.items():
@@ -479,10 +539,13 @@ def build_lexicon(sentences):
 
     return {
         "word_totals": word_totals,
+        "stem_totals": stem_totals,
         "dominant_tag": dominant_tag,
         "ambiguity_class": ambiguity_class,
         "dominant_coarse": dominant_coarse,
         "context_cluster": context_cluster,
+        "stem_dominant": stem_dominant,
+        "stem_ambiguity": stem_ambiguity,
         "sig_dominant": sig_dominant,
         "sig_ambiguity": sig_ambiguity,
     }
@@ -491,7 +554,8 @@ def build_lexicon(sentences):
 def lookup_word_priors(lexicon, raw_word, normal_word, position):
     """
     Return (prior_tag, ambig_class, coarse_tag, cluster_id, freq_bucket)
-    for a word using the training lexicon with morphological signature fallback.
+    for a word using the training lexicon, with morphological stem and
+    signature fallback for rare/unseen words.
     """
     if raw_word == ROOT_WORD:
         return (ROOT_WORD, ROOT_WORD, ROOT_WORD, "ROOT", "HIGH")
@@ -499,8 +563,6 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
     total = lexicon["word_totals"].get(normal_word, 0)
     sig = word_signature(raw_word, position)
 
-    # If a word is capitalized mid-sentence (MID_PROPN) and rare in lowercase,
-    # prefer its Proper Noun signature over a rare lowercase occurrence.
     if total >= 2 and not (sig.startswith("MID_PROPN") and total <= 3 and not raw_word.islower()):
         dom = lexicon["dominant_tag"][normal_word]
         amb = lexicon["ambiguity_class"][normal_word]
@@ -516,6 +578,18 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
             fb = "LOW"
         return (dom, amb, crs, clu, fb)
 
+    # Fallback 1: check morphological stem if the word is not a mid-sentence proper noun
+    st = stem_word(normal_word)
+    st_total = lexicon.get("stem_totals", {}).get(st, 0)
+    if st != normal_word and st_total >= 4 and not sig.startswith("MID_PROPN"):
+        dom = lexicon["stem_dominant"][st]
+        amb = lexicon["stem_ambiguity"][st]
+        crs = coarse_group(dom)
+        clu = "STEM_" + crs + "_" + sig.rsplit("|", 1)[-1]
+        fb = "STEM_SINGLE" if total == 1 else "STEM_OOV"
+        return (dom, amb, crs, clu, fb)
+
+    # Fallback 2: morphological signature
     dom = lexicon["sig_dominant"].get(sig, "UNK")
     amb = lexicon["sig_ambiguity"].get(sig, "UNK")
     crs = coarse_group(dom) if dom != "UNK" else "UNK"

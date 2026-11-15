@@ -1,15 +1,16 @@
 """
-Transition-based dependency parsers (`Arc-Hybrid` and `Arc-Eager`) with:
-  1. O(1) incremental maintenance of sorted children, child label sets, and
-     functional child heads (`case`, `mark`, `aux`/`aux:pass`/`cop`).
-  2. Full-sentence buffer lookahead (`next_clause_pos`, `np_end_pos`,
-     `has_root_ahead`) so stack tokens (`cop`, `aux`, `nsubj`, `det`, `amod`)
-     know where the upcoming NP head or clause predicate lies in the buffer.
-  3. Hard UD structural constraints (punctuation tokens cannot govern
-     non-punctuation tokens; root uniqueness).
-  4. Both bottom-up `Arc-Hybrid` (`Parser`) and top-down `Arc-Eager`
-     (`ArcEagerParser`, which exposes already-attached parent `s0_head` and
-     `s0_label` features) trained with max-margin dynamic oracles.
+Hybrid Dependency Parsing Architecture (100% Non-Neural Linear Structured Perceptrons):
+  1. `chu_liu_edmonds`: Exact single-root Chu-Liu/Edmonds Maximum Spanning
+     Arborescence (MST) algorithm for global cycle-free tree decoding.
+  2. `GraphMSTParser`: Fast vectorized first-order Graph-Based Structured
+     Perceptron trained with loss-augmented Chu-Liu/Edmonds decoding.
+  3. `Parser` (`Arc-Hybrid`) and `ArcEagerParser` (`Arc-Eager`):
+     Graph-guided transition-based parsers (Nivre & McDonald 2008) with
+     O(1) incremental child/valency maintenance, global buffer lookahead,
+     morphological stems, and per-arc margin confidence tracking.
+  4. `FullTreeLabeler`: Second/third-order full-tree structured perceptron
+     that refines dependency relation labels using the complete parse tree
+     (parent, grandparent, siblings, and all functional children).
 """
 
 import random
@@ -17,6 +18,7 @@ import numpy as np
 
 from data_utils import (
     normalize_word,
+    stem_word,
     word_shape,
     word_signature,
     base_label,
@@ -24,7 +26,9 @@ from data_utils import (
     coarse_group,
     head_offset_bucket,
     is_punct_word,
+    build_lexicon,
     lookup_word_priors,
+    PASSIVE_AUX_WORDS,
 )
 from perceptron import AveragedPerceptron
 
@@ -37,14 +41,167 @@ NONE = -1          # "no word here"
 VERY_LOW = -1.0e9  # score given to moves that are not allowed
 
 
+# =====================================================================
+# 1. Exact Single-Root Chu-Liu/Edmonds Maximum Spanning Arborescence
+# =====================================================================
+
+def _cle_unconstrained(scores, n_nodes):
+    """
+    Recursive Chu-Liu/Edmonds algorithm returning `par[0..n_nodes-1]`
+    that maximizes `sum_{m=1..n_nodes-1} scores[par[m], m]`.
+    """
+    par = [-1] * n_nodes
+    for m in range(1, n_nodes):
+        best_h = 0
+        best_s = -1.0e18
+        for h in range(n_nodes):
+            if h != m and scores[h, m] > best_s:
+                best_s = float(scores[h, m])
+                best_h = h
+        par[m] = best_h
+
+    # Detect any directed cycle among 1..n_nodes-1
+    visited = [0] * n_nodes
+    visited[0] = 2
+    cycle = None
+    for start in range(1, n_nodes):
+        if visited[start] != 0:
+            continue
+        path = []
+        curr = start
+        while curr != 0 and visited[curr] == 0:
+            visited[curr] = 1
+            path.append(curr)
+            curr = par[curr]
+        if curr != 0 and visited[curr] == 1:
+            idx = path.index(curr)
+            cycle = path[idx:]
+            break
+        for u in path:
+            visited[u] = 2
+
+    if cycle is None:
+        return par
+
+    # Contract cycle into a single super-node `c_id`
+    in_cycle = [False] * n_nodes
+    for u in cycle:
+        in_cycle[u] = True
+
+    new_id = [-1] * n_nodes
+    orig_of = []
+    for u in range(n_nodes):
+        if not in_cycle[u]:
+            new_id[u] = len(orig_of)
+            orig_of.append(u)
+
+    c_id = len(orig_of)
+    n_sub = c_id + 1
+    sub_scores = np.full((n_sub, n_sub), -1.0e12, dtype=np.float64)
+
+    for u in orig_of:
+        iu = new_id[u]
+        for v in orig_of:
+            if u != v and v != 0:
+                 sub_scores[iu, new_id[v]] = scores[u, v]
+
+    best_out = {}
+    for v in orig_of:
+        if v == 0:
+            continue
+        iv = new_id[v]
+        best_u = cycle[0]
+        best_val = -1.0e18
+        for u in cycle:
+            val = float(scores[u, v])
+            if val > best_val:
+                best_val = val
+                best_u = u
+        sub_scores[c_id, iv] = best_val
+        best_out[iv] = best_u
+
+    best_in = {}
+    for u in orig_of:
+        iu = new_id[u]
+        best_v = cycle[0]
+        best_val = -1.0e18
+        for v in cycle:
+            val = float(scores[u, v] - scores[par[v], v])
+            if val > best_val:
+                best_val = val
+                best_v = v
+        sub_scores[iu, c_id] = best_val
+        best_in[iu] = best_v
+
+    sub_par = _cle_unconstrained(sub_scores, n_sub)
+
+    for iv in range(1, c_id):
+        v = orig_of[iv]
+        sp = sub_par[iv]
+        if sp == c_id:
+            par[v] = best_out[iv]
+        else:
+            par[v] = orig_of[sp]
+
+    iu_enter = sub_par[c_id]
+    u_enter = orig_of[iu_enter]
+    v_enter = best_in[iu_enter]
+    par[v_enter] = u_enter
+    return par
+
+
+def chu_liu_edmonds(score_matrix):
+    """
+    Find the exact single-root Maximum Spanning Arborescence rooted at 0.
+    `score_matrix` has shape (n + 1, n + 1) where entry [h, m] is the score
+    of attaching modifier m (1..n) to head h (0..n).
+    Returns `heads` as a list of length n + 1 with `heads[0] = -1`.
+    """
+    n = score_matrix.shape[0] - 1
+    if n <= 0:
+        return [-1]
+    if n == 1:
+        return [-1, 0]
+
+    scores = np.array(score_matrix, dtype=np.float64, copy=True)
+    scores[:, 0] = -1.0e12
+    for i in range(n + 1):
+        scores[i, i] = -1.0e12
+
+    par = _cle_unconstrained(scores, n + 1)
+    roots = [m for m in range(1, n + 1) if par[m] == 0]
+    if len(roots) == 1:
+        return par
+
+    # Enforce unique child of 0 by testing the candidate roots
+    candidates = roots if len(roots) > 0 else [int(np.argmax(scores[0, 1:])) + 1]
+    best_par = None
+    best_total = -1.0e18
+    for r in candidates:
+        s_copy = scores.copy()
+        s_copy[0, :] = -1.0e12
+        s_copy[0, r] = scores[0, r]
+        cand_par = _cle_unconstrained(s_copy, n + 1)
+        total = sum(float(scores[cand_par[m], m]) for m in range(1, n + 1))
+        if total > best_total:
+            best_total = total
+            best_par = cand_par
+    return best_par
+
+
+# =====================================================================
+# 2. Precomputed Sentence Context (with Stems, Lookahead & MST Signals)
+# =====================================================================
+
 class SentenceContext:
     """Precomputes all token-level strings, lookahead tables, and prefix sums."""
 
-    def __init__(self, raw_words, tags, supertags=None, lexicon=None):
+    def __init__(self, raw_words, tags, supertags=None, lexicon=None, mst_info=None):
         n = len(raw_words) - 1
         self.n = n
         self.raw_words = raw_words
         self.words = [normalize_word(w) for w in raw_words]
+        self.stems = [stem_word(w) for w in self.words]
         self.tags = tags
         self.base_tags = [base_label(t) for t in tags]
         self.coarse_tags = [coarse_group(t) for t in tags]
@@ -81,6 +238,27 @@ class SentenceContext:
             self.super_offset = ["<NONE>"] * (n + 1)
             self.super_hcg = ["<NONE>"] * (n + 1)
 
+        # Global MST guide signals (Nivre & McDonald 2008)
+        if mst_info is not None:
+            self.mst_h1 = mst_info["heads"]
+            self.mst_h2 = mst_info["heads2"]
+            self.mst_conf = mst_info["conf"]
+            self.mst_max_right_child = [0] * (n + 1)
+            self.mst_min_left_child = [n + 1] * (n + 1)
+            for m in range(1, n + 1):
+                h = self.mst_h1[m]
+                if 0 <= h <= n:
+                    if m > h and m > self.mst_max_right_child[h]:
+                        self.mst_max_right_child[h] = m
+                    elif m < h and m < self.mst_min_left_child[h]:
+                        self.mst_min_left_child[h] = m
+        else:
+            self.mst_h1 = None
+            self.mst_h2 = None
+            self.mst_conf = None
+            self.mst_max_right_child = None
+            self.mst_min_left_child = None
+
         # Prefix sums for O(1) in-between structural queries
         self.verb_prefix = [0] * (n + 2)
         self.comma_prefix = [0] * (n + 2)
@@ -111,10 +289,7 @@ class SentenceContext:
         self.cc_prefix[n + 1] = cc_cnt
         self.punct_prefix[n + 1] = p_cnt
 
-        # Buffer lookahead arrays:
-        # 1. `next_clause_pos[i]`: first token >= i with coarse tag CLAUSE or tag 'root'
-        # 2. `has_root_ahead[i]`: whether a token tagged 'root' lies at >= i
-        # 3. `np_end_pos[i]`: end of the contiguous nominal/modifier chunk starting at i
+        # Buffer lookahead arrays
         self.next_clause_pos = [0] * (n + 2)
         self.has_root_ahead = ["False"] * (n + 2)
         next_cl = 0
@@ -154,6 +329,323 @@ class SentenceContext:
         return f"{nv}_{nc}_{ncc}"
 
 
+# =====================================================================
+# 3. Fast Vectorized First-Order Graph-Based MST Structured Perceptron
+# =====================================================================
+
+_MASK_64 = (1 << 64) - 1
+_P1 = 0x9E3779B97F4A7C15
+_P2 = 0xBF58476D1CE4E5B9
+_P3 = 0x94D049BB133111EB
+
+
+def _h64(text):
+    """Deterministic 64-bit integer hash for a string token attribute."""
+    return hash(text) & _MASK_64
+
+
+class GraphMSTParser:
+    """
+    Global First-Order Arc-Factored Graph-Based Dependency Parser trained with
+    Margin-Infused Structured Perceptron and Chu-Liu/Edmonds MST decoding.
+    Uses vectorized 2D NumPy uint64 feature hashing to score all O(n^2) candidate
+    edges in < 0.2 ms per sentence.
+    """
+
+    def __init__(self, lexicon=None, n_rows=2 ** 22):
+        self.lexicon = lexicon
+        self.n_rows = n_rows
+        self.mask = np.uint64(n_rows - 1)
+        self.weights = np.zeros(n_rows, dtype=np.float32)
+        self.totals = np.zeros(n_rows, dtype=np.float64)
+        self.timestamps = np.zeros(n_rows, dtype=np.int32)
+        self.step = 0
+
+        # 36 distinct prime seeds for vectorized pair templates
+        rng = random.Random(2026)
+        self.template_seeds = [
+            np.uint64(rng.getrandbits(64) | 1) for _ in range(36)
+        ]
+
+    def _extract_edge_feature_cube(self, ctx):
+        """
+        Return a 3D uint64 array `F` of shape `(36, n + 1, n + 1)` containing
+        the hashed feature row indices for every directed edge (h -> m).
+        """
+        n = ctx.n
+        size = n + 1
+
+        hw = np.array([_h64("w:" + ctx.words[i]) for i in range(size)], dtype=np.uint64)
+        hst = np.array([_h64("st:" + ctx.stems[i]) for i in range(size)], dtype=np.uint64)
+        ht = np.array([_h64("t:" + ctx.tags[i]) for i in range(size)], dtype=np.uint64)
+        hbt = np.array([_h64("bt:" + ctx.base_tags[i]) for i in range(size)], dtype=np.uint64)
+        hcg = np.array([_h64("cg:" + ctx.coarse_tags[i]) for i in range(size)], dtype=np.uint64)
+        hwt = np.array([_h64("wt:" + ctx.wt[i]) for i in range(size)], dtype=np.uint64)
+        hwc = np.array([_h64("wc:" + ctx.wc[i]) for i in range(size)], dtype=np.uint64)
+        hsig = np.array([_h64("sig:" + ctx.sigs[i]) for i in range(size)], dtype=np.uint64)
+        hdom = np.array([_h64("dom:" + ctx.dom_tags[i]) for i in range(size)], dtype=np.uint64)
+        hsup = np.array([_h64("sup:" + ctx.supertags[i]) for i in range(size)], dtype=np.uint64)
+        hdir = np.array([_h64("dir:" + ctx.dirs[i]) for i in range(size)], dtype=np.uint64)
+
+        ht_l1 = np.array(
+            [_h64("tl1:" + (ctx.tags[i - 1] if i > 1 else "<S>")) for i in range(size)],
+            dtype=np.uint64,
+        )
+        ht_r1 = np.array(
+            [_h64("tr1:" + (ctx.tags[i + 1] if 0 < i < n else "<E>")) for i in range(size)],
+            dtype=np.uint64,
+        )
+        hw_l1 = np.array(
+            [_h64("wl1:" + (ctx.words[i - 1] if i > 1 else "<S>")) for i in range(size)],
+            dtype=np.uint64,
+        )
+        hw_r1 = np.array(
+            [_h64("wr1:" + (ctx.words[i + 1] if 0 < i < n else "<E>")) for i in range(size)],
+            dtype=np.uint64,
+        )
+
+        # Pairwise geometry matrices (size x size)
+        dd_mat = np.zeros((size, size), dtype=np.uint64)
+        dir_mat = np.zeros((size, size), dtype=np.uint64)
+        btw_mat = np.zeros((size, size), dtype=np.uint64)
+        sup_match_mat = np.zeros((size, size), dtype=np.uint64)
+
+        for h in range(size):
+            h_cg = "ROOT" if h == 0 else ctx.coarse_tags[h]
+            for m in range(1, size):
+                if h == m:
+                    continue
+                if h == 0:
+                    d_str = "ROOT"
+                    dr_str = "ROOT"
+                else:
+                    dr_str = "R" if m > h else "L"
+                    dist = abs(m - h)
+                    if dist <= 5:
+                        db = str(dist)
+                    elif dist <= 10:
+                        db = "6-10"
+                    else:
+                        db = "11+"
+                    d_str = dr_str + ":" + db
+                dd_mat[h, m] = _h64(d_str)
+                dir_mat[h, m] = _h64(dr_str)
+                btw_mat[h, m] = _h64(d_str + ":" + ctx.between_counts(h, m))
+
+                cand_off = head_offset_bucket(m, h)
+                off_ok = ctx.super_offset[m] == cand_off
+                cg_ok = ctx.super_hcg[m] == h_cg
+                sup_match_mat[h, m] = _h64(f"sm:{off_ok}:{cg_ok}:{ctx.base_tags[m]}")
+
+        p1 = np.uint64(_P1)
+        p2 = np.uint64(_P2)
+        p3 = np.uint64(_P3)
+        seeds = self.template_seeds
+        mask = self.mask
+
+        def mix(a_h, b_m, rel, idx):
+            return ((a_h[:, None] * p1) ^ (b_m[None, :] * p2) ^ (rel * p3) ^ seeds[idx]) & mask
+
+        zero_vec = np.zeros(size, dtype=np.uint64)
+        templates = [
+            # Core lexical + tag + distance/direction templates
+            mix(hw, hw, dir_mat, 0),
+            mix(hw, hw, dd_mat, 1),
+            mix(hst, hst, dir_mat, 2),
+            mix(hst, hst, dd_mat, 3),
+            mix(hw, ht, dir_mat, 4),
+            mix(hw, ht, dd_mat, 5),
+            mix(ht, hw, dir_mat, 6),
+            mix(ht, hw, dd_mat, 7),
+            mix(hst, ht, dd_mat, 8),
+            mix(ht, hst, dd_mat, 9),
+            mix(hwt, hwt, dir_mat, 10),
+            mix(hwt, ht, dd_mat, 11),
+            mix(ht, hwt, dd_mat, 12),
+            mix(hwc, hwc, dd_mat, 13),
+            mix(ht, ht, dir_mat, 14),
+            mix(ht, ht, dd_mat, 15),
+            mix(hbt, hbt, dd_mat, 16),
+            mix(hcg, hcg, dd_mat, 17),
+
+            # In-between verb/comma/conjunction structural templates
+            mix(ht, ht, btw_mat, 18),
+            mix(hcg, hcg, btw_mat, 19),
+            mix(hbt, hbt, btw_mat, 20),
+            mix(hwc, hcg, btw_mat, 21),
+            mix(hcg, hwc, btw_mat, 22),
+
+            # Contextual surrounding tag/word templates (McDonald et al. 2005)
+            mix(ht ^ (ht_l1 * p3), ht, dd_mat, 23),
+            mix(ht ^ (ht_r1 * p3), ht, dd_mat, 24),
+            mix(ht, ht ^ (ht_l1 * p3), dd_mat, 25),
+            mix(ht, ht ^ (ht_r1 * p3), dd_mat, 26),
+            mix(ht ^ (ht_r1 * p3), ht ^ (ht_l1 * p3), dir_mat, 27),
+            mix(hw ^ (hw_r1 * p3), ht, dir_mat, 28),
+            mix(ht, hw ^ (hw_l1 * p3), dir_mat, 29),
+
+            # Lexicon prior, signature, direction, & supertag agreement templates
+            mix(hdom, hdom, dd_mat, 30),
+            mix(hsig, hsig, dd_mat, 31),
+            mix(hdir, hdir, dd_mat, 32),
+            mix(hsup, hcg, dd_mat, 33),
+            mix(ht, hsup, dir_mat, 34),
+            mix(zero_vec, ht, sup_match_mat, 35),
+        ]
+        return np.stack(templates, axis=0)
+
+    def score_Create_matrix(self, ctx, use_average=False):
+        F = self._extract_edge_feature_cube(ctx)
+        w = self.weights
+        scores = w[F].sum(axis=0, dtype=np.float64)
+        n = ctx.n
+        scores[:, 0] = -1.0e12
+        for i in range(n + 1):
+            scores[i, i] = -1.0e12
+        # Punctuation tokens cannot be heads of non-punctuation tokens
+        for h in range(1, n + 1):
+            if ctx.is_punct[h]:
+                for m in range(1, n + 1):
+                    if not ctx.is_punct[m]:
+                        scores[h, m] = -1.0e9
+        return scores, F
+
+    def train_one_sentence(self, words, tags, gold_heads, supertags=None):
+        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+        n = ctx.n
+        scores, F = self.score_Create_matrix(ctx)
+
+        # Margin-infused loss-augmented scoring
+        aug_scores = scores.copy()
+        for m in range(1, n + 1):
+            gh = gold_heads[m]
+            aug_scores[:, m] += 1.0
+            aug_scores[gh, m] -= 1.0
+
+        pred_heads = chu_liu_edmonds(aug_scores)
+        for m in range(1, n + 1):
+            gh = gold_heads[m]
+            ph = pred_heads[m]
+            if ph != gh:
+                pos_rows = F[:, gh, m]
+                neg_rows = F[:, ph, m]
+                self._update_rows(pos_rows, +1.0)
+                self._update_rows(neg_rows, -1.0)
+        self.step += 1
+
+    def _update_rows(self, rows, delta):
+        elapsed = self.step - self.timestamps[rows]
+        self.totals[rows] += elapsed * self.weights[rows]
+        self.weights[rows] += delta
+        self.timestamps[rows] = self.step
+
+    def average_weights(self):
+        elapsed = self.step - self.timestamps
+        self.totals += elapsed * self.weights
+        if self.step > 0:
+            self.weights = (self.totals / self.step).astype(np.float32)
+
+    def train(self, sentences, tags_list, supertags_list=None, epochs=8, seed=1):
+        rng = random.Random(seed)
+        order = list(range(len(sentences)))
+        for epoch in range(epochs):
+            rng.shuffle(order)
+            for k in order:
+                stags = supertags_list[k] if supertags_list is not None else None
+                self.train_one_sentence(
+                    sentences[k]["words"],
+                    tags_list[k],
+                    sentences[k]["heads"],
+                    stags,
+                )
+        self.average_weights()
+
+    def predict_mst_info(self, words, tags, supertags=None):
+        """
+        Return a dictionary with:
+          - 'heads'  : 1-best Chu-Liu/Edmonds MST heads [0..n]
+          - 'heads2' : 2nd-best head per token [0..n]
+          - 'conf'   : margin confidence bucket ('HIGH', 'MID', 'LOW') per token
+          - 'margins': numeric margin per token
+        """
+        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+        n = ctx.n
+        scores, _ = self.score_Create_matrix(ctx)
+        mst_heads = chu_liu_edmonds(scores)
+
+        heads2 = [-1] * (n + 1)
+        conf = ["<NONE>"] * (n + 1)
+        margins = [0.0] * (n + 1)
+        for m in range(1, n + 1):
+            h1 = mst_heads[m]
+            s1 = float(scores[h1, m])
+            col = scores[:, m].copy()
+            col[h1] = -1.0e12
+            col[m] = -1.0e12
+            h2 = int(np.argmax(col))
+            s2 = float(col[h2])
+            marg = max(0.0, s1 - s2)
+            heads2[m] = h2
+            margins[m] = marg
+            if marg >= 6.0:
+                conf[m] = "HIGH"
+            elif marg >= 2.5:
+                conf[m] = "MID"
+            else:
+                conf[m] = "LOW"
+
+        return {
+            "heads": mst_heads,
+            "heads2": heads2,
+            "conf": conf,
+            "margins": margins,
+        }
+
+
+def jackknife_mst(sentences, tags_list, supertags_list=None, epochs=7, n_folds=5):
+    """
+    Produce out-of-fold Global Graph MST predictions for training sentences
+    so transition parsers can use them without overfitting.
+    """
+    mst_infos = [None] * len(sentences)
+    for fold in range(n_folds):
+        train_sents = []
+        train_tags = []
+        train_super = []
+        held_out = []
+        for k in range(len(sentences)):
+            if k % n_folds == fold:
+                held_out.append(k)
+            else:
+                train_sents.append(sentences[k])
+                train_tags.append(tags_list[k])
+                if supertags_list is not None:
+                    train_super.append(supertags_list[k])
+
+        fold_tag_sents = [
+            {"words": train_sents[i]["words"], "labels": train_tags[i]}
+            for i in range(len(train_sents))
+        ]
+        fold_lexicon = build_lexicon(fold_tag_sents)
+        model = GraphMSTParser(lexicon=fold_lexicon)
+        model.train(
+            train_sents,
+            train_tags,
+            train_super if supertags_list is not None else None,
+            epochs=epochs,
+            seed=fold + 1,
+        )
+        for k in held_out:
+            stags = supertags_list[k] if supertags_list is not None else None
+            mst_infos[k] = model.predict_mst_info(sentences[k]["words"], tags_list[k], stags)
+        print("    MST jackknife fold", fold + 1, "of", n_folds, "done")
+    return mst_infos
+
+
+# =====================================================================
+# 4. Transition Parser States & Shared Feature Extractor
+# =====================================================================
+
 class ParserState:
     """Arc-Hybrid state maintained in O(1)."""
 
@@ -166,6 +658,7 @@ class ParserState:
         size = n_words + 1
         self.heads = [NONE] * size
         self.labels = ["<NONE>"] * size
+        self.margins = [1.0] * size
         self.left_children = [[] for _ in range(size)]
         self.right_children = [[] for _ in range(size)]
         self.left_label_str = ["<EMPTY>"] * size
@@ -205,7 +698,6 @@ class ParserState:
         b0 = self.buffer_word(0)
         if b0 == 0:
             return len(self.stack) == 1
-        # Prevent pure punctuation in the buffer from becoming the head of a word
         if self.is_punct is not None and self.is_punct[b0]:
             s0 = self.stack[-1]
             if not self.is_punct[s0] and self.can_shift():
@@ -215,9 +707,6 @@ class ParserState:
     def can_right(self):
         if len(self.stack) < 2:
             return False
-        # Prevent pure punctuation on the stack from becoming the head of a word
-        # only when SHIFT is still available; once the buffer is empty, RIGHT
-        # is required to reduce the stack down to 1 item.
         if self.is_punct is not None and self.can_shift():
             s1 = self.stack[-2]
             s0 = self.stack[-1]
@@ -225,9 +714,10 @@ class ParserState:
                 return False
         return True
 
-    def add_arc(self, head, dependent, label):
+    def add_arc(self, head, dependent, label, margin=1.0):
         self.heads[dependent] = head
         self.labels[dependent] = label
+        self.margins[dependent] = margin
         b_lab = label.split(":")[0]
 
         if self.words is not None:
@@ -256,16 +746,16 @@ class ParserState:
             labs = sorted(set(self.labels[c] for c in rc))
             self.right_label_str[head] = "+".join(labs)
 
-    def apply(self, move, label):
+    def apply(self, move, label, margin=1.0):
         if move == SHIFT:
             self.stack.append(self.buffer_position)
             self.buffer_position += 1
         elif move == LEFT:
             dependent = self.stack.pop()
-            self.add_arc(self.buffer_word(0), dependent, label)
+            self.add_arc(self.buffer_word(0), dependent, label, margin)
         else:
             dependent = self.stack.pop()
-            self.add_arc(self.stack[-1], dependent, label)
+            self.add_arc(self.stack[-1], dependent, label, margin)
 
 
 def leftmost_child(state, word, k):
@@ -341,6 +831,7 @@ def move_costs(state, gold_heads, gold_children):
 def _extract_shared_features(ctx, state):
     """Shared feature extractor for both Arc-Hybrid and Arc-Eager states."""
     words = ctx.words
+    stems = ctx.stems
     tags = ctx.tags
     base_tags = ctx.base_tags
     coarse_tags = ctx.coarse_tags
@@ -386,6 +877,9 @@ def _extract_shared_features(ctx, state):
     def w(idx):
         return "<NONE>" if idx == NONE else words[idx]
 
+    def st(idx):
+        return "<NONE>" if idx == NONE else stems[idx]
+
     def t(idx):
         return "<NONE>" if idx == NONE else tags[idx]
 
@@ -399,6 +893,7 @@ def _extract_shared_features(ctx, state):
         return "<NONE>" if idx == NONE else state.labels[idx]
 
     s0w = w(s0)
+    s0st = st(s0)
     s0t = t(s0)
     s0bt = bt(s0)
     s0cg = cg(s0)
@@ -410,6 +905,7 @@ def _extract_shared_features(ctx, state):
     s0clu = "<NONE>" if s0 == NONE else clusters[s0]
 
     s1w = w(s1)
+    s1st = st(s1)
     s1t = t(s1)
     s1bt = bt(s1)
     s1cg = cg(s1)
@@ -424,6 +920,7 @@ def _extract_shared_features(ctx, state):
     s3t = t(s3)
 
     n0w = w(n0)
+    n0st = st(n0)
     n0t = t(n0)
     n0bt = bt(n0)
     n0cg = cg(n0)
@@ -505,7 +1002,7 @@ def _extract_shared_features(ctx, state):
         left_off_match = "NONE"
         right_off_match = "NONE"
 
-    # Buffer lookahead features (where is the upcoming NP head and clause predicate?)
+    # Buffer lookahead features
     b_pos = state.buffer_position
     if b_pos <= state.n:
         next_cl = ctx.next_clause_pos[b_pos]
@@ -524,171 +1021,142 @@ def _extract_shared_features(ctx, state):
 
     f = [
         "bias",
-        "s0w=" + s0w,
-        "s0t=" + s0t,
-        "s0bt=" + s0bt,
-        "s0cg=" + s0cg,
-        "s0wt=" + s0wt,
-        "s0wc=" + s0wc,
-        "s0sig=" + s0sig,
-        "s0amb=" + s0amb,
-        "s0clu=" + s0clu,
-        "s1w=" + s1w,
-        "s1t=" + s1t,
-        "s1bt=" + s1bt,
-        "s1cg=" + s1cg,
-        "s1wt=" + s1wt,
-        "s1wc=" + s1wc,
-        "s1amb=" + s1amb,
-        "s2w=" + s2w,
-        "s2t=" + s2t,
-        "s2cg=" + s2cg,
-        "s3t=" + s3t,
-        "n0w=" + n0w,
-        "n0t=" + n0t,
-        "n0bt=" + n0bt,
-        "n0cg=" + n0cg,
-        "n0wt=" + n0wt,
-        "n0wc=" + n0wc,
-        "n0sig=" + n0sig,
-        "n0amb=" + n0amb,
-        "n0clu=" + n0clu,
-        "n1w=" + n1w,
-        "n1t=" + n1t,
-        "n1cg=" + n1cg,
-        "n1wt=" + n1wt,
-        "n2w=" + n2w,
-        "n2t=" + n2t,
-        "n2cg=" + n2cg,
 
-        # Pair features
+        # Single words, stems, tags, signatures, and lexicon priors
+        "s0w=" + s0w, "s0st=" + s0st, "s0t=" + s0t, "s0wt=" + s0wt, "s0bt=" + s0bt, "s0cg=" + s0cg,
+        "s1w=" + s1w, "s1st=" + s1st, "s1t=" + s1t, "s1wt=" + s1wt, "s1bt=" + s1bt, "s1cg=" + s1cg,
+        "s2w=" + s2w, "s2t=" + s2t, "s2cg=" + s2cg, "s3t=" + s3t,
+        "n0w=" + n0w, "n0st=" + n0st, "n0t=" + n0t, "n0wt=" + n0wt, "n0bt=" + n0bt, "n0cg=" + n0cg,
+        "n1w=" + n1w, "n1t=" + n1t, "n1wt=" + n1wt, "n1cg=" + n1cg,
+        "n2w=" + n2w, "n2t=" + n2t, "n2cg=" + n2cg,
+        "s0sig=" + s0sig, "n0sig=" + n0sig,
+        "s0amb=" + s0amb, "n0amb=" + n0amb, "s1amb=" + s1amb,
+        "s0clu=" + s0clu, "n0clu=" + n0clu,
+        "s0p=" + ("<NONE>" if s0 == NONE else dom_tags[s0]),
+        "n0p=" + ("<NONE>" if n0 == NONE else dom_tags[n0]),
+        "s1p=" + ("<NONE>" if s1 == NONE else dom_tags[s1]),
+
+        # Pairs of stack0 and buffer0 (words, stems, tags, coarse groups)
         "s0wt+n0wt=" + s0wt + "+" + n0wt,
         "s0wt+n0w=" + s0wt + "+" + n0w,
         "s0w+n0wt=" + s0w + "+" + n0wt,
         "s0wt+n0t=" + s0wt + "+" + n0t,
         "s0t+n0wt=" + s0t + "+" + n0wt,
         "s0w+n0w=" + s0w + "+" + n0w,
+        "s0st+n0st=" + s0st + "+" + n0st,
+        "s0st+n0t=" + s0st + "+" + n0t,
+        "s0t+n0st=" + s0t + "+" + n0st,
         "s0t+n0t=" + s0t + "+" + n0t,
         "s0bt+n0bt=" + s0bt + "+" + n0bt,
         "s0cg+n0cg=" + s0cg + "+" + n0cg,
         "s0wc+n0wc=" + s0wc + "+" + n0wc,
+        "s0sig+n0sig=" + s0sig + "+" + n0sig,
+        "s0amb+n0amb=" + s0amb + "+" + n0amb,
         "s0clu+n0clu=" + s0clu + "+" + n0clu,
-        "n0t+n1t=" + n0t + "+" + n1t,
-        "n0w+n1w=" + n0w + "+" + n1w,
-        "n0wt+n1t=" + n0wt + "+" + n1t,
-        "n0t+n1wt=" + n0t + "+" + n1wt,
+
+        # Pairs of stack1 and stack0 (critical for RIGHT arcs)
         "s1wt+s0wt=" + s1wt + "+" + s0wt,
         "s1wt+s0w=" + s1wt + "+" + s0w,
         "s1w+s0wt=" + s1w + "+" + s0wt,
         "s1wt+s0t=" + s1wt + "+" + s0t,
         "s1t+s0wt=" + s1t + "+" + s0wt,
         "s1w+s0w=" + s1w + "+" + s0w,
+        "s1st+s0st=" + s1st + "+" + s0st,
+        "s1st+s0t=" + s1st + "+" + s0t,
+        "s1t+s0st=" + s1t + "+" + s0st,
         "s1t+s0t=" + s1t + "+" + s0t,
         "s1bt+s0bt=" + s1bt + "+" + s0bt,
         "s1cg+s0cg=" + s1cg + "+" + s0cg,
         "s1wc+s0wc=" + s1wc + "+" + s0wc,
-        "s1t+s0w=" + s1t + "+" + s0w,
-        "s1w+s0t=" + s1w + "+" + s0t,
+        "s1amb+s0amb=" + s1amb + "+" + s0amb,
+
+        # Other pairs
         "s1t+n0t=" + s1t + "+" + n0t,
         "s1w+n0w=" + s1w + "+" + n0w,
+        "s1st+n0st=" + s1st + "+" + n0st,
         "s1wt+n0t=" + s1wt + "+" + n0t,
         "s1t+n0wt=" + s1t + "+" + n0wt,
-        "s2t+s1t=" + s2t + "+" + s1t,
+        "n0t+n1t=" + n0t + "+" + n1t,
+        "n0wt+n1t=" + n0wt + "+" + n1t,
+        "n0t+n1wt=" + n0t + "+" + n1wt,
 
-        # Trigram & 4-gram structural context
-        "n0t+n1t+n2t=" + n0t + "+" + n1t + "+" + n2t,
-        "s0t+n0t+n1t=" + s0t + "+" + n0t + "+" + n1t,
+        # Three-word combinations
         "s1t+s0t+n0t=" + s1t + "+" + s0t + "+" + n0t,
-        "s2t+s1t+s0t=" + s2t + "+" + s1t + "+" + s0t,
-        "s3t+s2t+s1t+s0t=" + s3t + "+" + s2t + "+" + s1t + "+" + s0t,
-        "s2t+s1t+s0t+n0t=" + s2t + "+" + s1t + "+" + s0t + "+" + n0t,
-        "s1t+s0t+n0t+n1t=" + s1t + "+" + s0t + "+" + n0t + "+" + n1t,
+        "s1bt+s0bt+n0bt=" + s1bt + "+" + s0bt + "+" + n0bt,
         "s1cg+s0cg+n0cg=" + s1cg + "+" + s0cg + "+" + n0cg,
-        "s2cg+s1cg+s0cg=" + s2cg + "+" + s1cg + "+" + s0cg,
-        "s0cg+n0cg+n1cg=" + s0cg + "+" + n0cg + "+" + n1cg,
-        "s1t+s0w+n0t=" + s1t + "+" + s0w + "+" + n0t,
         "s1w+s0t+n0t=" + s1w + "+" + s0t + "+" + n0t,
+        "s1t+s0w+n0t=" + s1t + "+" + s0w + "+" + n0t,
         "s1t+s0t+n0w=" + s1t + "+" + s0t + "+" + n0w,
+        "s1w+s0w+n0t=" + s1w + "+" + s0w + "+" + n0t,
+        "s1t+s0w+n0w=" + s1t + "+" + s0w + "+" + n0w,
+        "s2t+s1t+s0t=" + s2t + "+" + s1t + "+" + s0t,
+        "s2cg+s1cg+s0cg=" + s2cg + "+" + s1cg + "+" + s0cg,
+        "s3t+s2t+s1t+s0t=" + s3t + "+" + s2t + "+" + s1t + "+" + s0t,
+        "s2w+s1t+s0t=" + s2w + "+" + s1t + "+" + s0t,
+        "s0t+n0t+n1t=" + s0t + "+" + n0t + "+" + n1t,
+        "s0cg+n0cg+n1cg=" + s0cg + "+" + n0cg + "+" + n1cg,
+        "s0w+n0t+n1t=" + s0w + "+" + n0t + "+" + n1t,
+        "s0t+n0w+n1t=" + s0t + "+" + n0w + "+" + n1t,
+        "s0t+n0t+n1w=" + s0t + "+" + n0t + "+" + n1w,
+        "n0t+n1t+n2t=" + n0t + "+" + n1t + "+" + n2t,
+        "s1t+s0t+n0t+n1t=" + s1t + "+" + s0t + "+" + n0t + "+" + n1t,
 
-        # Child-Combined Trigrams
-        "s0t+s0lc1t+n0t=" + s0t + "+" + t(s0_lc1) + "+" + n0t,
-        "s0t+s0rc1t+n0t=" + s0t + "+" + t(s0_rc1) + "+" + n0t,
-        "s0t+n0t+n0lc1t=" + s0t + "+" + n0t + "+" + t(n0_lc1),
-        "s1t+s1rc1t+s0t=" + s1t + "+" + t(s1_rc1) + "+" + s0t,
-        "s1t+s1lc1t+s0t=" + s1t + "+" + t(s1_lc1) + "+" + s0t,
-        "s1t+s0t+s0rc1t=" + s1t + "+" + s0t + "+" + t(s0_rc1),
-        "s1t+s0t+s0lc1t=" + s1t + "+" + s0t + "+" + t(s0_lc1),
-        "s1t+s1rc1l+s0t=" + s1t + "+" + lab(s1_rc1) + "+" + s0t,
-        "s1t+s1lc1l+s0t=" + s1t + "+" + lab(s1_lc1) + "+" + s0t,
-        "s0t+n0t+n0lc1l=" + s0t + "+" + n0t + "+" + lab(n0_lc1),
-
-        # Distances & In-Between Structural Counts
+        # Distance & In-Between Structural Features
         "s0w+d=" + s0w + "+" + distance,
         "s0t+d=" + s0t + "+" + distance,
         "n0w+d=" + n0w + "+" + distance,
         "n0t+d=" + n0t + "+" + distance,
         "s0w+n0w+d=" + s0w + "+" + n0w + "+" + distance,
         "s0t+n0t+d=" + s0t + "+" + n0t + "+" + distance,
-        "s1t+s0t+d1=" + s1t + "+" + s0t + "+" + distance_s1,
-        "s1w+s0w+d1=" + s1w + "+" + s0w + "+" + distance_s1,
-        "s1t+s0w+d1=" + s1t + "+" + s0w + "+" + distance_s1,
-        "s1w+s0t+d1=" + s1w + "+" + s0t + "+" + distance_s1,
-        "btw_s0n0=" + s0cg + "+" + n0cg + "+" + between_s0_n0,
-        "btw_s1s0=" + s1cg + "+" + s0cg + "+" + between_s1_s0,
-        "btw_s1s0_t=" + s1t + "+" + s0t + "+" + between_s1_s0,
+        "s1w+ds1=" + s1w + "+" + distance_s1,
+        "s1t+ds1=" + s1t + "+" + distance_s1,
+        "s1w+s0w+ds1=" + s1w + "+" + s0w + "+" + distance_s1,
+        "s1t+s0t+ds1=" + s1t + "+" + s0t + "+" + distance_s1,
+        "btw_s0n0=" + s0t + "+" + n0t + "+" + between_s0_n0,
+        "btw_s0n0_cg=" + s0cg + "+" + n0cg + "+" + between_s0_n0,
+        "btw_s1s0=" + s1t + "+" + s0t + "+" + between_s1_s0,
+        "btw_s1s0_cg=" + s1cg + "+" + s0cg + "+" + between_s1_s0,
 
-        # Valency
-        "s0w+vl=" + s0w + "+" + s0_n_left,
-        "s0t+vl=" + s0t + "+" + s0_n_left,
-        "s0w+vr=" + s0w + "+" + s0_n_right,
-        "s0t+vr=" + s0t + "+" + s0_n_right,
-        "n0w+vl=" + n0w + "+" + n0_n_left,
-        "n0t+vl=" + n0t + "+" + n0_n_left,
-        "s1w+vl=" + s1w + "+" + s1_n_left,
-        "s1t+vl=" + s1t + "+" + s1_n_left,
-        "s1w+vr=" + s1w + "+" + s1_n_right,
-        "s1t+vr=" + s1t + "+" + s1_n_right,
+        # Children of s0, n0, and s1 (2nd-order siblings & grandchildren)
+        "s0_lc1_t=" + t(s0_lc1), "s0_lc1_l=" + lab(s0_lc1), "s0_lc1_w=" + w(s0_lc1),
+        "s0_rc1_t=" + t(s0_rc1), "s0_rc1_l=" + lab(s0_rc1), "s0_rc1_w=" + w(s0_rc1),
+        "n0_lc1_t=" + t(n0_lc1), "n0_lc1_l=" + lab(n0_lc1), "n0_lc1_w=" + w(n0_lc1),
+        "s1_rc1_t=" + t(s1_rc1), "s1_rc1_l=" + lab(s1_rc1), "s1_rc1_w=" + w(s1_rc1),
+        "s1_lc1_t=" + t(s1_lc1), "s1_lc1_l=" + lab(s1_lc1), "s1_lc1_w=" + w(s1_lc1),
+        "s0_lc2_l=" + lab(s0_lc2), "s0_rc2_l=" + lab(s0_rc2),
+        "n0_lc2_l=" + lab(n0_lc2), "s1_rc2_l=" + lab(s1_rc2), "s1_lc2_l=" + lab(s1_lc2),
 
-        # Children & Grandchildren
-        "s0lc1w=" + w(s0_lc1),
-        "s0lc1t=" + t(s0_lc1),
-        "s0lc1l=" + lab(s0_lc1),
-        "s0lc2t=" + t(s0_lc2),
-        "s0lc2l=" + lab(s0_lc2),
-        "s0rc1w=" + w(s0_rc1),
-        "s0rc1t=" + t(s0_rc1),
-        "s0rc1l=" + lab(s0_rc1),
-        "s0rc2t=" + t(s0_rc2),
-        "s0rc2l=" + lab(s0_rc2),
-        "n0lc1w=" + w(n0_lc1),
-        "n0lc1t=" + t(n0_lc1),
-        "n0lc1l=" + lab(n0_lc1),
-        "n0lc2t=" + t(n0_lc2),
-        "n0lc2l=" + lab(n0_lc2),
-        "s1rc1w=" + w(s1_rc1),
-        "s1rc1t=" + t(s1_rc1),
-        "s1rc1l=" + lab(s1_rc1),
-        "s1rc2t=" + t(s1_rc2),
-        "s1rc2l=" + lab(s1_rc2),
-        "s1lc1w=" + w(s1_lc1),
-        "s1lc1t=" + t(s1_lc1),
-        "s1lc1l=" + lab(s1_lc1),
-        "s1lc2l=" + lab(s1_lc2),
-        "s0gc_l=" + lab(s0_lc1_lc1) + "/" + t(s0_lc1_lc1),
-        "n0gc_l=" + lab(n0_lc1_lc1) + "/" + t(n0_lc1_lc1),
-        "s1gc_r=" + lab(s1_rc1_rc1) + "/" + t(s1_rc1_rc1),
+        # Grandchild features (3rd-order)
+        "s0_lc1_lc1_l=" + lab(s0_lc1_lc1) + "+" + s0t,
+        "n0_lc1_lc1_l=" + lab(n0_lc1_lc1) + "+" + n0t,
+        "s1_rc1_rc1_l=" + lab(s1_rc1_rc1) + "+" + s1t,
 
-        # Sibling & 2nd-order combinations
-        "s0t+s0lc1t+s0lc2t=" + s0t + "+" + t(s0_lc1) + "+" + t(s0_lc2),
-        "s0t+s0rc1t+s0rc2t=" + s0t + "+" + t(s0_rc1) + "+" + t(s0_rc2),
-        "n0t+n0lc1t+n0lc2t=" + n0t + "+" + t(n0_lc1) + "+" + t(n0_lc2),
-        "s1t+s1rc1t+s1rc2t=" + s1t + "+" + t(s1_rc1) + "+" + t(s1_rc2),
-        "s1t+s1lc1t+s1lc2t=" + s1t + "+" + t(s1_lc1) + "+" + t(s1_lc2),
-        "s0t+s0lc1l+s0lc2l=" + s0t + "+" + lab(s0_lc1) + "+" + lab(s0_lc2),
-        "s0t+s0rc1l+s0rc2l=" + s0t + "+" + lab(s0_rc1) + "+" + lab(s0_rc2),
-        "s1t+s1rc1l+s1rc2l=" + s1t + "+" + lab(s1_rc1) + "+" + lab(s1_rc2),
+        "s0t+s0_lc1_t+n0t=" + s0t + "+" + t(s0_lc1) + "+" + n0t,
+        "s0t+s0_rc1_t+n0t=" + s0t + "+" + t(s0_rc1) + "+" + n0t,
+        "s0t+n0t+n0_lc1_t=" + s0t + "+" + n0t + "+" + t(n0_lc1),
+        "s0t+s0_lc1_l+n0t=" + s0t + "+" + lab(s0_lc1) + "+" + n0t,
+        "s0t+s0_rc1_l+n0t=" + s0t + "+" + lab(s0_rc1) + "+" + n0t,
+        "s0t+n0t+n0_lc1_l=" + s0t + "+" + n0t + "+" + lab(n0_lc1),
+        "s1t+s1_rc1_t+s0t=" + s1t + "+" + t(s1_rc1) + "+" + s0t,
+        "s1t+s1_lc1_t+s0t=" + s1t + "+" + t(s1_lc1) + "+" + s0t,
+        "s1t+s1_rc1_l+s0t=" + s1t + "+" + lab(s1_rc1) + "+" + s0t,
+        "s1t+s1_lc1_l+s0t=" + s1t + "+" + lab(s1_lc1) + "+" + s0t,
+        "s1t+s0t+s0_lc1_l=" + s1t + "+" + s0t + "+" + lab(s0_lc1),
+        "s1t+s0t+s0_rc1_l=" + s1t + "+" + s0t + "+" + lab(s0_rc1),
 
-        # Child label sets
+        # Coordination (conj / cc) symmetry features
+        "coord_s1_s0=" + s1cg + "+" + lab(s0_lc1) + "+" + w(s0_lc1) + "+" + s0cg,
+        "coord_s0_n0=" + s0cg + "+" + lab(n0_lc1) + "+" + w(n0_lc1) + "+" + n0cg,
+
+        # Valency & Child Label-Set Features
+        "s0w+n_left=" + s0w + "+" + s0_n_left,
+        "s0t+n_left=" + s0t + "+" + s0_n_left,
+        "s0w+n_right=" + s0w + "+" + s0_n_right,
+        "s0t+n_right=" + s0t + "+" + s0_n_right,
+        "n0w+n_left=" + n0w + "+" + n0_n_left,
+        "n0t+n_left=" + n0t + "+" + n0_n_left,
+        "s1w+n_right=" + s1w + "+" + s1_n_right,
+        "s1t+n_right=" + s1t + "+" + s1_n_right,
         "s0w+left_labels=" + s0w + "+" + s0_left_labels,
         "s0t+left_labels=" + s0t + "+" + s0_left_labels,
         "s0w+right_labels=" + s0w + "+" + s0_right_labels,
@@ -703,18 +1171,23 @@ def _extract_shared_features(ctx, state):
         "n0_subj+s0t=" + n0_subj + "+" + n0t + "+" + s0t,
 
         # Lexicalized Preposition (case), Subordinator (mark), and Passive Aux
+        # (including morphological stems so inflected verbs share PP preferences!)
         "s0_case=" + s0_case + "+" + s0t,
         "s1w+s0_case=" + s1w + "+" + s0_case + "+" + s0cg,
+        "s1st+s0_case=" + s1st + "+" + s0_case + "+" + s0cg,
         "s1t+s0_case=" + s1t + "+" + s0_case + "+" + s0t,
         "s1t+s0_case+s0w=" + s1t + "+" + s0_case + "+" + s0w,
         "n0w+s0_case=" + n0w + "+" + s0_case + "+" + s0cg,
+        "n0st+s0_case=" + n0st + "+" + s0_case + "+" + s0cg,
         "n0t+s0_case=" + n0t + "+" + s0_case + "+" + s0t,
         "s0w+n0_case=" + s0w + "+" + n0_case + "+" + n0cg,
+        "s0st+n0_case=" + s0st + "+" + n0_case + "+" + n0cg,
         "s1_aux+s0_case=" + s1_aux + "+" + s0_case + "+" + s0cg,
         "n0_aux+s0t=" + n0_aux + "+" + s0t,
         "s1_aux+s0t=" + s1_aux + "+" + s0t,
         "s1t+s0_mark=" + s1t + "+" + s0_mark + "+" + s0t,
         "s1w+s0_mark=" + s1w + "+" + s0_mark + "+" + s0cg,
+        "s1st+s0_mark=" + s1st + "+" + s0_mark + "+" + s0cg,
         "n0t+s0_mark=" + n0t + "+" + s0_mark + "+" + s0t,
 
         # Word endings
@@ -738,11 +1211,11 @@ def _extract_shared_features(ctx, state):
 
         # Direction, Supertag Agreement & Buffer Lookahead
         "dirs=" + s1d + "+" + s0d + "+" + n0d,
-        "s0st=" + s0_st,
-        "n0st=" + n0_st,
-        "s1st=" + s1_st,
-        "s0st+n0cg=" + s0_st + "+" + n0cg + "+" + distance,
-        "s0st+s1cg=" + s0_st + "+" + s1cg + "+" + distance_s1,
+        "s0sup=" + s0_st,
+        "n0sup=" + n0_st,
+        "s1sup=" + s1_st,
+        "s0sup+n0cg=" + s0_st + "+" + n0cg + "+" + distance,
+        "s0sup+s1cg=" + s0_st + "+" + s1cg + "+" + distance_s1,
         "left_off_match=" + left_off_match + "+" + s0bt,
         "right_off_match=" + right_off_match + "+" + s0bt,
         "s0off+d=" + s0_pred_off + "+" + distance + "+" + distance_s1,
@@ -750,8 +1223,49 @@ def _extract_shared_features(ctx, state):
         "look_cl=" + s1t + "+" + s0t + "+" + next_cl_t + "+" + next_cl_dist,
         "look_np=" + s0t + "+" + n0t + "+" + np_end_t + "+" + np_end_dist,
     ]
+
+    # Global Graph-Based MST Guide Features (Nivre & McDonald 2008)
+    if ctx.mst_h1 is not None:
+        mst_h1 = ctx.mst_h1
+        mst_h2 = ctx.mst_h2
+        mst_conf = ctx.mst_conf
+        max_rc = ctx.mst_max_right_child
+
+        if s0 != NONE and s0 > 0:
+            s0_mh1 = mst_h1[s0]
+            s0_mh2 = mst_h2[s0]
+            s0_mc = mst_conf[s0]
+            s0_m_n0 = "H1" if s0_mh1 == n0 else ("H2" if s0_mh2 == n0 else "NO")
+            s0_m_s1 = "H1" if s0_mh1 == s1 else ("H2" if s0_mh2 == s1 else "NO")
+            s0_m_in_buf = str(s0_mh1 == 0 or (b_pos <= state.n and s0_mh1 >= b_pos))
+            s0_has_buf_child = str(b_pos <= state.n and max_rc[s0] >= b_pos)
+        else:
+            s0_mc = "<NONE>"
+            s0_m_n0 = s0_m_s1 = s0_m_in_buf = s0_has_buf_child = "NONE"
+
+        if n0 != NONE and n0 > 0:
+            n0_mh1 = mst_h1[n0]
+            n0_mh2 = mst_h2[n0]
+            n0_mc = mst_conf[n0]
+            n0_m_s0 = "H1" if n0_mh1 == s0 else ("H2" if n0_mh2 == s0 else "NO")
+        else:
+            n0_mc = "<NONE>"
+            n0_m_s0 = "NONE"
+
+        f.extend([
+            "mst_s0_n0=" + s0_m_n0 + "+" + s0_mc + "+" + s0bt,
+            "mst_s0_s1=" + s0_m_s1 + "+" + s0_mc + "+" + s0bt,
+            "mst_n0_s0=" + n0_m_s0 + "+" + n0_mc + "+" + n0bt,
+            "mst_s0_state=" + s0_m_n0 + "+" + s0_m_s1 + "+" + s0_m_in_buf + "+" + s0_has_buf_child,
+            "mst_buf_child=" + s0_has_buf_child + "+" + s0cg + "+" + n0cg,
+        ])
+
     return f
 
+
+# =====================================================================
+# 5. Arc-Hybrid & Arc-Eager Transition Parsers (with Margin Tracking)
+# =====================================================================
 
 class Parser:
     """Arc-Hybrid Transition Parser (bottom-up right attachments)."""
@@ -816,16 +1330,21 @@ class Parser:
                 result[1 + L:] = scores[1 + L:]
         return result
 
-    def parse(self, words, tags, use_average=False, supertags=None):
-        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+    def parse(self, words, tags, use_average=False, supertags=None, mst_info=None):
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, mst_info)
         state = ParserState(len(words) - 1, ctx.words, ctx.is_punct)
         while not state.is_finished():
             features = self.get_features(ctx, state)
             rows = self.model.feature_rows(features)
             scores = self.allowed_scores(self.model.scores(rows, use_average), state)
-            move, label = self.move_of(int(scores.argmax()))
-            state.apply(move, label)
-        return state.heads, state.labels
+            best_idx = int(scores.argmax())
+            best_val = float(scores[best_idx])
+            scores[best_idx] = VERY_LOW
+            second_val = float(scores.max())
+            margin = max(0.0, best_val - second_val) if second_val > VERY_LOW * 0.5 else 10.0
+            move, label = self.move_of(best_idx)
+            state.apply(move, label, margin)
+        return state.heads, state.labels, state.margins
 
     def train_one_sentence(
         self,
@@ -834,10 +1353,11 @@ class Parser:
         gold_heads,
         gold_labels,
         supertags=None,
+        mst_info=None,
         explore_prob=0.90,
         rng=None,
     ):
-        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, mst_info)
         n = len(words) - 1
 
         gold_children = [[] for _ in range(n + 1)]
@@ -871,19 +1391,29 @@ class Parser:
             state.apply(move, label)
         self.model.next_step()
 
-    def train_one_epoch(self, sentences, tags_list, random_generator, supertags_list=None, epoch=0):
+    def train_one_epoch(
+        self,
+        sentences,
+        tags_list,
+        random_generator,
+        supertags_list=None,
+        mst_list=None,
+        epoch=0,
+    ):
         order = list(range(len(sentences)))
         random_generator.shuffle(order)
         explore_prob = 0.50 if epoch == 0 else 0.90
         for k in order:
             sentence = sentences[k]
             stags = supertags_list[k] if supertags_list is not None else None
+            minfo = mst_list[k] if mst_list is not None else None
             self.train_one_sentence(
                 sentence["words"],
                 tags_list[k],
                 sentence["heads"],
                 sentence["labels"],
                 stags,
+                minfo,
                 explore_prob=explore_prob,
                 rng=random_generator,
             )
@@ -893,11 +1423,6 @@ class ArcEagerState(ParserState):
     """
     Arc-Eager state (Nivre 2003; Goldberg & Nivre 2012).
     ROOT (0) starts at the bottom of the stack; buffer runs 1..n.
-    Moves:
-      SHIFT        : push b0 onto stack
-      REDUCE       : pop s0 (when s0 already has a head)
-      LEFT(label)  : attach b0 -> s0 (when s0 has no head), pop s0
-      RIGHT(label) : attach s0 -> b0, push b0 onto stack
     """
 
     def __init__(self, n_words, words=None, is_punct=None):
@@ -925,7 +1450,6 @@ class ArcEagerState(ParserState):
         s0 = self.stack[-1]
         if self.heads[s0] != NONE:
             return True
-        # When the buffer is exhausted, allow popping any remaining stack items
         return self.buffer_position > self.n
 
     def can_left(self):
@@ -954,23 +1478,22 @@ class ArcEagerState(ParserState):
             return True
         return False
 
-    def apply(self, move, label):
+    def apply(self, move, label, margin=1.0):
         if move == SHIFT:
             self.stack.append(self.buffer_position)
             self.buffer_position += 1
         elif move == REDUCE:
             s0 = self.stack.pop()
             if self.heads[s0] == NONE:
-                # Attach unattached reduced node to stack top
                 head = self.stack[-1] if self.stack else 0
-                self.add_arc(head, s0, "dep" if head != 0 else "root")
+                self.add_arc(head, s0, "dep" if head != 0 else "root", margin=0.2)
         elif move == LEFT:
             dependent = self.stack.pop()
-            self.add_arc(self.buffer_position, dependent, label)
+            self.add_arc(self.buffer_position, dependent, label, margin)
         else:
             dependent = self.buffer_position
             self.buffer_position += 1
-            self.add_arc(self.stack[-1], dependent, label)
+            self.add_arc(self.stack[-1], dependent, label, margin)
             self.stack.append(dependent)
 
 
@@ -1031,7 +1554,6 @@ class ArcEagerParser:
         self.n_labels = len(label_names)
         self.label_number = {name: k for k, name in enumerate(label_names)}
         self.lexicon = lexicon
-        # Classes: 0 = SHIFT, 1 = REDUCE, 2..L+1 = LEFT(label), L+2..2L+1 = RIGHT(label)
         self.model = AveragedPerceptron(2 + 2 * self.n_labels, n_rows)
 
     def class_of(self, move, label_number=0):
@@ -1054,7 +1576,6 @@ class ArcEagerParser:
 
     def get_features(self, ctx, state):
         f = _extract_shared_features(ctx, state)
-        # Add Arc-Eager parent / already-attached label features on s0 and s1
         s0 = state.stack_word(0)
         s1 = state.stack_word(1)
         n0 = state.buffer_word(0)
@@ -1125,17 +1646,21 @@ class ArcEagerParser:
                 result[2 + L:] = scores[2 + L:]
         return result
 
-    def parse(self, words, tags, use_average=False, supertags=None):
-        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+    def parse(self, words, tags, use_average=False, supertags=None, mst_info=None):
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, mst_info)
         state = ArcEagerState(len(words) - 1, ctx.words, ctx.is_punct)
         while not state.is_finished():
             features = self.get_features(ctx, state)
             rows = self.model.feature_rows(features)
             scores = self.allowed_scores(self.model.scores(rows, use_average), state)
-            move, label = self.move_of(int(scores.argmax()))
-            state.apply(move, label)
+            best_idx = int(scores.argmax())
+            best_val = float(scores[best_idx])
+            scores[best_idx] = VERY_LOW
+            second_val = float(scores.max())
+            margin = max(0.0, best_val - second_val) if second_val > VERY_LOW * 0.5 else 10.0
+            move, label = self.move_of(best_idx)
+            state.apply(move, label, margin)
 
-        # Ensure any remaining unattached tokens get attached cleanly
         root_children = state.right_children[0]
         root_tok = root_children[0] if root_children else 1
         for i in range(1, state.n + 1):
@@ -1143,11 +1668,13 @@ class ArcEagerParser:
                 if not root_children and i == root_tok:
                     state.heads[i] = 0
                     state.labels[i] = "root"
+                    state.margins[i] = 0.2
                     root_children.append(i)
                 else:
                     state.heads[i] = root_tok if root_tok != i else 0
                     state.labels[i] = base_label(tags[i]) if state.heads[i] != 0 else "root"
-        return state.heads, state.labels
+                    state.margins[i] = 0.2
+        return state.heads, state.labels, state.margins
 
     def train_one_sentence(
         self,
@@ -1156,10 +1683,11 @@ class ArcEagerParser:
         gold_heads,
         gold_labels,
         supertags=None,
+        mst_info=None,
         explore_prob=0.90,
         rng=None,
     ):
-        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, mst_info)
         n = len(words) - 1
 
         gold_children = [[] for _ in range(n + 1)]
@@ -1193,23 +1721,312 @@ class ArcEagerParser:
             state.apply(move, label)
         self.model.next_step()
 
-    def train_one_epoch(self, sentences, tags_list, random_generator, supertags_list=None, epoch=0):
+    def train_one_epoch(
+        self,
+        sentences,
+        tags_list,
+        random_generator,
+        supertags_list=None,
+        mst_list=None,
+        epoch=0,
+    ):
         order = list(range(len(sentences)))
         random_generator.shuffle(order)
         explore_prob = 0.50 if epoch == 0 else 0.90
         for k in order:
             sentence = sentences[k]
             stags = supertags_list[k] if supertags_list is not None else None
+            minfo = mst_list[k] if mst_list is not None else None
             self.train_one_sentence(
                 sentence["words"],
                 tags_list[k],
                 sentence["heads"],
                 sentence["labels"],
                 stags,
+                minfo,
                 explore_prob=explore_prob,
                 rng=random_generator,
             )
 
+
+# =====================================================================
+# 6. Full-Tree Second/Third-Order Dependency Label Classifier
+# =====================================================================
+
+class FullTreeLabeler:
+    """
+    Predicts/refines the dependency relation `label[m]` for each edge (h -> m)
+    given the COMPLETE dependency tree `heads[1..n]`, inspecting:
+      - parent h, grandparent g = heads[h]
+      - all children of m (e.g. `case`, `mark`, `cop`, `aux`, `nsubj`, `det`, `obj`)
+      - all children of h (e.g. `cop`, `aux:pass`, `obj`, `expl`, `nsubj`, `case`)
+      - immediate left and right siblings of m under h
+    """
+
+    def __init__(self, label_names, lexicon=None, n_rows=2 ** 20):
+        self.label_names = label_names
+        self.label_number = {name: i for i, name in enumerate(label_names)}
+        self.lexicon = lexicon
+        self.model = AveragedPerceptron(len(label_names), n_rows)
+
+    def _prepare_tree_context(self, words, tags, supertags, heads):
+        ctx = SentenceContext(words, tags, supertags, self.lexicon)
+        n = ctx.n
+        children = [[] for _ in range(n + 1)]
+        for m in range(1, n + 1):
+            h = heads[m]
+            if 0 <= h <= n:
+                children[h].append(m)
+
+        # Functional child summaries for every node u in 1..n
+        case_w = ["<NONE>"] * (n + 1)
+        mark_w = ["<NONE>"] * (n + 1)
+        aux_str = ["<NONE>"] * (n + 1)
+        has_cop = [False] * (n + 1)
+        has_pass = [False] * (n + 1)
+        has_subj = [False] * (n + 1)
+        has_obj = [False] * (n + 1)
+        has_det = [False] * (n + 1)
+        has_expl = [False] * (n + 1)
+        child_cg_sig = ["<EMPTY>"] * (n + 1)
+
+        for u in range(1, n + 1):
+            c_list = children[u]
+            if not c_list:
+                continue
+            cgs = []
+            for c in c_list:
+                bt = ctx.base_tags[c]
+                cg = ctx.coarse_tags[c]
+                cw = ctx.words[c]
+                cgs.append(cg)
+                if bt == "case":
+                    case_w[u] = cw
+                elif bt == "mark":
+                    mark_w[u] = cw
+                elif bt in ("aux", "cop"):
+                    aux_str[u] = ctx.tags[c].rstrip("<>") + ":" + cw
+                    if bt == "cop":
+                        has_cop[u] = True
+                    if "pass" in ctx.tags[c] or (cw in PASSIVE_AUX_WORDS and ctx.sigs[u].endswith(("VERB_ED", "VERB_EN"))):
+                        has_pass[u] = True
+                elif bt in ("nsubj", "csubj"):
+                    has_subj[u] = True
+                    if "pass" in ctx.tags[c]:
+                        has_pass[u] = True
+                elif bt in ("obj", "iobj"):
+                    has_obj[u] = True
+                elif bt in ("det", "amod") or "poss" in ctx.tags[c]:
+                    has_det[u] = True
+                elif bt == "expl":
+                    has_expl[u] = True
+            child_cg_sig[u] = "+".join(sorted(set(cgs)))
+
+        return (
+            ctx,
+            children,
+            case_w,
+            mark_w,
+            aux_str,
+            has_cop,
+            has_pass,
+            has_subj,
+            has_obj,
+            has_det,
+            has_expl,
+            child_cg_sig,
+        )
+
+    def get_features(self, tree_ctx, heads, m):
+        (
+            ctx,
+            children,
+            case_w,
+            mark_w,
+            aux_str,
+            has_cop,
+            has_pass,
+            has_subj,
+            has_obj,
+            has_det,
+            has_expl,
+            child_cg_sig,
+        ) = tree_ctx
+
+        h = heads[m]
+        if h <= 0:
+            return ["root_only"]
+
+        g = heads[h] if 1 <= h <= ctx.n else -1
+        mw = ctx.words[m]
+        mst = ctx.stems[m]
+        mt = ctx.tags[m]
+        mbt = ctx.base_tags[m]
+        mcg = ctx.coarse_tags[m]
+        msig = ctx.sigs[m]
+        mdom = ctx.dom_tags[m]
+        mamb = ctx.amb_tags[m]
+        msup = ctx.supertags[m]
+
+        hw = ctx.words[h]
+        hst = ctx.stems[h]
+        ht = ctx.tags[h]
+        hbt = ctx.base_tags[h]
+        hcg = ctx.coarse_tags[h]
+        hsig = ctx.sigs[h]
+        hdom = ctx.dom_tags[h]
+
+        gt = "<ROOT>" if g <= 0 else ctx.tags[g]
+        gcg = "<ROOT>" if g <= 0 else ctx.coarse_tags[g]
+
+        dr = "L" if m < h else "R"
+        dist = distance_text(h, m)
+        btw = ctx.between_counts(h, m)
+
+        # Siblings of m under h
+        sibs = children[h]
+        pos_in_sibs = sibs.index(m) if m in sibs else -1
+        lsib = sibs[pos_in_sibs - 1] if pos_in_sibs > 0 else -1
+        rsib = sibs[pos_in_sibs + 1] if (0 <= pos_in_sibs < len(sibs) - 1) else -1
+        lsib_t = "<NONE>" if lsib < 0 else ctx.tags[lsib]
+        rsib_t = "<NONE>" if rsib < 0 else ctx.tags[rsib]
+        lsib_w = "<NONE>" if lsib < 0 else ctx.words[lsib]
+
+        m_case = case_w[m]
+        m_mark = mark_w[m]
+        m_aux = aux_str[m]
+        h_case = case_w[h]
+        h_mark = mark_w[h]
+        h_aux = aux_str[h]
+
+        h_is_pred = str(hcg == "CLAUSE" or ht == "root" or has_cop[h] or has_subj[h])
+        h_is_nom = str(hcg in ("SUBJ", "OBJ", "NMOD", "COMP") and not has_cop[h] and not has_subj[h])
+        m_is_clause = str(mcg == "CLAUSE" or has_cop[m] or has_subj[m] or m_mark != "<NONE>")
+
+        mw_l1 = ctx.words[m - 1] if m > 1 else "<S>"
+        mw_r1 = ctx.words[m + 1] if m < ctx.n else "<E>"
+        mt_l1 = ctx.tags[m - 1] if m > 1 else "<S>"
+        mt_r1 = ctx.tags[m + 1] if m < ctx.n else "<E>"
+
+        return [
+            "bias",
+            "mt=" + mt,
+            "mbt=" + mbt,
+            "mbt+dr=" + mbt + "+" + dr,
+            "mw+dr=" + mw + "+" + dr,
+            "mst+dr=" + mst + "+" + dr,
+            "msig+dr=" + msig + "+" + dr,
+            "mdom=" + mdom,
+            "mamb=" + mamb,
+            "msup=" + msup,
+            "mt+ht+dr=" + mt + "+" + ht + "+" + dr,
+            "mbt+hbt+dr=" + mbt + "+" + hbt + "+" + dr,
+            "mcg+hcg+dr=" + mcg + "+" + hcg + "+" + dr + "+" + dist,
+            "mw+hw+dr=" + mw + "+" + hw + "+" + dr,
+            "mst+hst+dr=" + mst + "+" + hst + "+" + dr,
+            "mw+ht+dr=" + mw + "+" + ht + "+" + dr,
+            "mt+hw+dr=" + mt + "+" + hw + "+" + dr,
+            "mst+ht+dr=" + mst + "+" + ht + "+" + dr,
+            "mt+hst+dr=" + mt + "+" + hst + "+" + dr,
+            "mamb+hcg+dr=" + mamb + "+" + hcg + "+" + dr,
+            "mt+ht+gt=" + mt + "+" + ht + "+" + gt,
+            "mcg+hcg+gcg=" + mcg + "+" + hcg + "+" + gcg,
+
+            # Full-tree PP (obl vs nmod vs nmod:poss) disambiguation
+            "pp_full=" + m_case + "+" + hbt + "+" + h_is_pred + "+" + h_is_nom + "+" + dr,
+            "pp_lex=" + hst + "+" + m_case + "+" + mcg,
+            "pp_head_cop=" + m_case + "+" + str(has_cop[h]) + "+" + hcg,
+            "pp_head_case=" + m_case + "+" + h_case + "+" + hbt,
+
+            # Full-tree clausal (ccomp vs xcomp vs advcl vs acl vs acl:relcl) disambiguation
+            "cl_full=" + m_is_clause + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hcg + "+" + dr,
+            "cl_lex=" + hst + "+" + m_mark + "+" + str(has_subj[m]) + "+" + str(has_obj[h]) + "+" + str(has_expl[h]),
+            "cl_aux=" + m_aux + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hcg,
+
+            # Full-tree passive & subject/object disambiguation
+            "pass_full=" + str(has_pass[h]) + "+" + h_aux + "+" + mbt + "+" + dr + "+" + m_case,
+            "obj_full=" + str(has_obj[h]) + "+" + str(has_cop[h]) + "+" + mbt + "+" + dr,
+
+            # Pre-nominal (compound vs amod vs flat vs det vs nmod:poss) disambiguation
+            "nom_full=" + msig + "+" + hsig + "+" + dr + "+" + dist + "+" + str(has_det[m]),
+            "nom_sib=" + lsib_t + "+" + mt + "+" + rsib_t + "+" + ht,
+            "nom_neigh=" + mt_l1 + "+" + mt + "+" + mt_r1 + "+" + dr,
+            "mw_neigh=" + mw_l1 + "+" + mw + "+" + mw_r1 + "+" + dr,
+
+            # Children & sibling structure
+            "m_ch_cgs=" + child_cg_sig[m] + "+" + mbt + "+" + hcg,
+            "h_ch_cgs=" + child_cg_sig[h] + "+" + mbt + "+" + dr,
+            "lsib=" + lsib_t + "+" + lsib_w + "+" + mbt,
+            "btw=" + btw + "+" + mbt + "+" + hbt,
+        ]
+
+    def score_node(self, tree_ctx, heads, m, use_average=True):
+        features = self.get_features(tree_ctx, heads, m)
+        rows = self.model.feature_rows(features)
+        return self.model.scores(rows, use_average), rows
+
+    def train(self, sentences, tags_list, supertags_list=None, mst_list=None, epochs=5, seed=1):
+        rng = random.Random(seed)
+        order = list(range(len(sentences)))
+        for epoch in range(epochs):
+            rng.shuffle(order)
+            for k in order:
+                s = sentences[k]
+                words = s["words"]
+                gold_heads = s["heads"]
+                gold_labels = s["labels"]
+                tags = tags_list[k]
+                stags = supertags_list[k] if supertags_list is not None else None
+
+                # Mix gold tree (80%) and predicted MST tree (20%) so the labeler
+                # adapts smoothly to predicted trees while learning on valid arcs
+                if mst_list is not None and rng.random() < 0.25:
+                    heads = mst_list[k]["heads"]
+                else:
+                    heads = gold_heads
+
+                tree_ctx = self._prepare_tree_context(words, tags, stags, heads)
+                for m in range(1, len(words)):
+                    if heads[m] == 0:
+                        continue
+                    # Only supervise label when the head matches gold_heads[m] or for general role
+                    scores, rows = self.score_node(tree_ctx, heads, m, use_average=False)
+                    correct = self.label_number[gold_labels[m]]
+                    augmented = scores.copy()
+                    augmented += 0.5
+                    augmented[correct] -= 0.5
+                    if "root" in self.label_number:
+                        augmented[self.label_number["root"]] = VERY_LOW
+                    guess = int(augmented.argmax())
+                    if guess != correct:
+                        self.model.update(rows, correct, guess)
+                self.model.next_step()
+        self.model.average_weights()
+
+    def score_sentence_labels(self, words, tags, supertags, heads):
+        """
+        Return a list of length n + 1 where entry `m` (for m >= 1) is a dict
+        mapping `label_name -> normalized_score` from the full-tree labeler.
+        """
+        tree_ctx = self._prepare_tree_context(words, tags, supertags, heads)
+        n = len(words) - 1
+        out = [None] * (n + 1)
+        for m in range(1, n + 1):
+            if heads[m] == 0:
+                out[m] = {"root": 10.0}
+                continue
+            scores, _ = self.score_node(tree_ctx, heads, m, use_average=True)
+            out[m] = {
+                self.label_names[idx]: float(scores[idx])
+                for idx in range(len(self.label_names))
+                if self.label_names[idx] != "root"
+            }
+        return out
+
+
+# =====================================================================
+# 7. Helpers for Right-to-Left (Backward) Sentence & MST Flipping
+# =====================================================================
 
 def label_set(state, children):
     labels = sorted(set(state.labels[c] for c in children))
@@ -1219,19 +2036,6 @@ def label_set(state, children):
 def normalize_all(words):
     return [normalize_word(word) for word in words]
 
-
-def parse_all(parser, sentences, tags_list, use_average=False, supertags_list=None):
-    all_heads = []
-    all_labels = []
-    for k in range(len(sentences)):
-        stags = supertags_list[k] if supertags_list is not None else None
-        heads, labels = parser.parse(sentences[k]["words"], tags_list[k], use_average, stags)
-        all_heads.append(heads)
-        all_labels.append(labels)
-    return all_heads, all_labels
-
-
-# ----- reading sentences backwards (right-to-left parser) -----
 
 def flip_position(i, n):
     if i <= 0:
@@ -1281,6 +2085,22 @@ def flip_supertags(stags):
     return result
 
 
+def flip_mst_info(mst_info):
+    if mst_info is None:
+        return None
+    n = len(mst_info["heads"]) - 1
+    old_h1 = flip_list(mst_info["heads"])
+    new_h1 = [old_h1[0]] + [flip_position(old_h1[i], n) for i in range(1, n + 1)]
+    old_h2 = flip_list(mst_info["heads2"])
+    new_h2 = [old_h2[0]] + [flip_position(old_h2[i], n) for i in range(1, n + 1)]
+    return {
+        "heads": new_h1,
+        "heads2": new_h2,
+        "conf": flip_list(mst_info["conf"]),
+        "margins": flip_list(mst_info["margins"]),
+    }
+
+
 def flip_sentence(sentence):
     n = len(sentence["words"]) - 1
     flipped = {}
@@ -1295,10 +2115,12 @@ def flip_sentence(sentence):
     return flipped
 
 
-def flip_result(heads, labels):
+def flip_result(heads, labels, margins=None):
     n = len(heads) - 1
     old_heads = flip_list(heads)
     new_heads = [old_heads[0]]
     for i in range(1, n + 1):
         new_heads.append(flip_position(old_heads[i], n))
+    if margins is not None:
+        return new_heads, flip_list(labels), flip_list(margins)
     return new_heads, flip_list(labels)

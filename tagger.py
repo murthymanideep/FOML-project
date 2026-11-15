@@ -1,30 +1,26 @@
 """
-The tagger: gives every word a rich syntactic tag (and head-offset supertag)
-before parsing.
+Sequence taggers for predicting each word's:
+  1. Fine-grained relation + attachment direction (`tag`, e.g. "nsubj>", "obl<", "root")
+  2. Relative head-offset + head coarse category (`supertag`, e.g. "+1:OBJ", "-2:CLAUSE", "ROOT:ROOT")
 
-Key capabilities:
-  1. Fold-safe lexicon & distributional word priors (dominant tag, ambiguity
-     class, coarse syntactic group, context cluster, and morphological
-     signature fallback for OOV/rare words and Proper Nouns).
-  2. Bidirectional Pass-1 tagging: trains BOTH a Left-to-Right (forward)
-     tagger and a Right-to-Left (backward) tagger so every word gets
-     predictions conditioned on both left history and right history.
-  3. Pass-2 stacked refinement tagger: combines forward Pass-1 tags,
-     backward Pass-1 tags, agreement indicators, and lexical context.
-  4. Relative head-offset supertagger (`htags`) that predicts signed
-     attachment distance buckets and head coarse categories.
+Uses:
+  - Fold-specific empirical word/stem/signature priors (`build_lexicon`)
+    computed strictly inside each jackknife training fold to prevent leakage.
+  - Bidirectional Pass-1 tagging (Left-to-Right and Right-to-Left) with
+    global sentence-level clause/root/nominal offset lookahead in Pass-2 and
+    Supertagging.
+  - Margin-infused structured perceptron updates with scheduled exploration.
 """
 
 import random
 
 from data_utils import (
-    ROOT_WORD,
     normalize_word,
+    stem_word,
     word_shape,
     word_signature,
-    base_label,
-    tag_direction,
     coarse_group,
+    tag_direction,
     head_offset_bucket,
     build_lexicon,
     lookup_word_priors,
@@ -36,32 +32,161 @@ START = "<START>"
 END = "<END>"
 
 
+def make_word_tag(sentence, index):
+    """Build the tag of word `index`, for example "nsubj>" or "root"."""
+    head = sentence["heads"][index]
+    label = sentence["labels"][index]
+    if head == 0:
+        return "root"
+    if head < index:
+        return label + "<"
+    return label + ">"
+
+
+def make_tag_targets(sentences):
+    """Return a copy of the sentences where "labels" are the directional tags."""
+    tagged_sentences = []
+    for sentence in sentences:
+        tags = [sentence["words"][0]]
+        for i in range(1, len(sentence["words"])):
+            tags.append(make_word_tag(sentence, i))
+        new_sentence = {}
+        new_sentence["name"] = sentence["name"]
+        new_sentence["words"] = sentence["words"]
+        new_sentence["heads"] = sentence["heads"]
+        new_sentence["labels"] = tags
+        tagged_sentences.append(new_sentence)
+    return tagged_sentences
+
+
+def make_supertag_targets(sentences):
+    """
+    Return a copy of the sentences where "labels" are relative head-offset +
+    head coarse syntactic category supertags (e.g., '+1:OBJ', '-2:CLAUSE').
+    """
+    super_sentences = []
+    for sentence in sentences:
+        words = sentence["words"]
+        heads = sentence["heads"]
+        labels = sentence["labels"]
+        stags = [words[0]]
+        for i in range(1, len(words)):
+            h = heads[i]
+            offset = head_offset_bucket(i, h)
+            h_cg = "ROOT" if h == 0 else coarse_group(labels[h])
+            stags.append(offset + ":" + h_cg)
+        new_sentence = {}
+        new_sentence["name"] = sentence["name"]
+        new_sentence["words"] = words
+        new_sentence["heads"] = heads
+        new_sentence["labels"] = stags
+        super_sentences.append(new_sentence)
+    return super_sentences
+
+
+def tag_accuracy(tag_sentences, predicted_tags):
+    total = 0
+    correct = 0
+    for k in range(len(tag_sentences)):
+        gold = tag_sentences[k]["labels"]
+        pred = predicted_tags[k]
+        for i in range(1, len(gold)):
+            total += 1
+            if gold[i] == pred[i]:
+                correct += 1
+    return 100.0 * correct / total
+
+
+def _prepare_global_tag_context(first_tags, backward_tags=None):
+    """
+    Precompute whole-sentence structural lookahead from Pass-1 tags:
+      - relative offset from token i to the nearest predicted `root`
+      - relative offset from token i to nearest left/right `CLAUSE`
+      - relative offset from token i to nearest left/right `NOMINAL` (`SUBJ`/`OBJ`/`NMOD`)
+    """
+    n = len(first_tags) - 1
+    c_tags = [coarse_group(t) for t in first_tags]
+
+    # Locate predicted roots
+    roots = [i for i in range(1, n + 1) if first_tags[i] == "root"]
+    if not roots and backward_tags is not None:
+        roots = [i for i in range(1, n + 1) if backward_tags[i] == "root"]
+
+    left_cl = [0] * (n + 1)
+    left_nom = [0] * (n + 1)
+    last_cl = 0
+    last_nom = 0
+    for i in range(1, n + 1):
+        left_cl[i] = last_cl
+        left_nom[i] = last_nom
+        if c_tags[i] == "CLAUSE" or first_tags[i] == "root":
+            last_cl = i
+        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP"):
+            last_nom = i
+
+    right_cl = [0] * (n + 1)
+    right_nom = [0] * (n + 1)
+    next_cl = 0
+    next_nom = 0
+    for i in range(n, 0, -1):
+        right_cl[i] = next_cl
+        right_nom[i] = next_nom
+        if c_tags[i] == "CLAUSE" or first_tags[i] == "root":
+            next_cl = i
+        if c_tags[i] in ("SUBJ", "OBJ", "NMOD", "COMP"):
+            next_nom = i
+
+    off_root = ["NONE"] * (n + 1)
+    off_l_cl = ["NONE"] * (n + 1)
+    off_r_cl = ["NONE"] * (n + 1)
+    off_l_nom = ["NONE"] * (n + 1)
+    off_r_nom = ["NONE"] * (n + 1)
+
+    for i in range(1, n + 1):
+        if roots:
+            nearest_r = min(roots, key=lambda r: abs(r - i))
+            off_root[i] = "SELF" if nearest_r == i else head_offset_bucket(i, nearest_r)
+        if left_cl[i] > 0:
+            off_l_cl[i] = head_offset_bucket(i, left_cl[i]) + ":" + c_tags[left_cl[i]]
+        if right_cl[i] > 0:
+            off_r_cl[i] = head_offset_bucket(i, right_cl[i]) + ":" + c_tags[right_cl[i]]
+        if left_nom[i] > 0:
+            off_l_nom[i] = head_offset_bucket(i, left_nom[i]) + ":" + c_tags[left_nom[i]]
+        if right_nom[i] > 0:
+            off_r_nom[i] = head_offset_bucket(i, right_nom[i]) + ":" + c_tags[right_nom[i]]
+
+    return (off_root, off_l_cl, off_r_cl, off_l_nom, off_r_nom, str(min(len(roots), 3)))
+
+
 class Tagger:
 
-    def __init__(self, tag_names, lexicon=None, direction="left-to-right", n_rows=2 ** 20):
+    def __init__(self, tag_names, lexicon=None, n_rows=2 ** 20, direction="left-to-right"):
         self.tag_names = tag_names
-        self.tag_number = {name: k for k, name in enumerate(tag_names)}
+        self.tag_number = {name: i for i, name in enumerate(tag_names)}
         self.lexicon = lexicon
         self.direction = direction
         self.model = AveragedPerceptron(len(tag_names), n_rows)
 
     def _prepare_sentence(self, words):
+        n = len(words) - 1
         normal_words = [normalize_word(w) for w in words]
+        stems = [stem_word(w) for w in normal_words]
         shapes = [word_shape(w) for w in words]
-        sigs = [word_signature(words[i], i) for i in range(len(words))]
+        sigs = [word_signature(words[i], i) for i in range(n + 1)]
         if self.lexicon is not None:
             priors = [
                 lookup_word_priors(self.lexicon, words[i], normal_words[i], i)
-                for i in range(len(words))
+                for i in range(n + 1)
             ]
         else:
-            priors = [("UNK", "UNK", "UNK", "UNK", "UNK") for _ in words]
-        return normal_words, shapes, sigs, priors
+            priors = [("UNK", "UNK", "UNK", "UNK", "OOV")] * (n + 1)
+        return normal_words, stems, shapes, sigs, priors
 
     def get_features(
         self,
         words,
         normal_words,
+        stems,
         shapes,
         sigs,
         priors,
@@ -70,111 +195,140 @@ class Tagger:
         previous_tag_2,
         first_tags=None,
         backward_tags=None,
+        global_ctx=None,
     ):
-        """Features for the word at position i (positions start at 1)."""
         n = len(words) - 1
         word = words[i]
         normal = normal_words[i]
+        stem0 = stems[i]
         shape = shapes[i]
-        sig = sigs[i]
+        sig0 = sigs[i]
         dom0, amb0, crs0, clu0, fb0 = priors[i]
 
-        if i - 1 >= 1:
+        if i > 1:
             w_m1 = normal_words[i - 1]
+            st_m1 = stems[i - 1]
             sh_m1 = shapes[i - 1]
+            sig_m1 = sigs[i - 1]
             dom_m1, amb_m1, crs_m1, clu_m1, _ = priors[i - 1]
         else:
-            w_m1 = sh_m1 = dom_m1 = amb_m1 = crs_m1 = clu_m1 = START
+            w_m1 = st_m1 = sh_m1 = sig_m1 = dom_m1 = amb_m1 = crs_m1 = clu_m1 = START
 
-        if i - 2 >= 1:
+        if i > 2:
             w_m2 = normal_words[i - 2]
             crs_m2 = priors[i - 2][2]
+            dom_m2 = priors[i - 2][0]
         else:
-            w_m2 = crs_m2 = START
+            w_m2 = crs_m2 = dom_m2 = START
 
-        if i - 3 >= 1:
-            w_m3 = normal_words[i - 3]
-        else:
-            w_m3 = START
+        w_m3 = normal_words[i - 3] if i > 3 else START
 
-        if i + 1 <= n:
+        if i < n:
             w_p1 = normal_words[i + 1]
+            st_p1 = stems[i + 1]
             sh_p1 = shapes[i + 1]
+            sig_p1 = sigs[i + 1]
             dom_p1, amb_p1, crs_p1, clu_p1, _ = priors[i + 1]
         else:
-            w_p1 = sh_p1 = dom_p1 = amb_p1 = crs_p1 = clu_p1 = END
+            w_p1 = st_p1 = sh_p1 = sig_p1 = dom_p1 = amb_p1 = crs_p1 = clu_p1 = END
 
-        if i + 2 <= n:
+        if i + 1 < n:
             w_p2 = normal_words[i + 2]
-            dom_p2, _, crs_p2, _, _ = priors[i + 2]
+            crs_p2 = priors[i + 2][2]
+            dom_p2 = priors[i + 2][0]
         else:
-            w_p2 = dom_p2 = crs_p2 = END
+            w_p2 = crs_p2 = dom_p2 = END
 
-        if i + 3 <= n:
+        if i + 2 < n:
             w_p3 = normal_words[i + 3]
             crs_p3 = priors[i + 3][2]
         else:
             w_p3 = crs_p3 = END
 
-        prev_c1 = coarse_group(previous_tag)
-        prev_c2 = coarse_group(previous_tag_2)
+        prev_cg = coarse_group(previous_tag)
+        prev2_cg = coarse_group(previous_tag_2)
 
         features = [
             "bias",
             "w=" + normal,
             "raw=" + word,
-            "sig=" + sig,
+            "stem=" + stem0,
             "shape=" + shape,
-            "dom=" + dom0,
-            "amb=" + amb0,
-            "crs=" + crs0,
-            "clu=" + clu0,
-            "fb=" + fb0,
-            "dom+w=" + dom0 + "+" + normal,
-            "amb+shape=" + amb0 + "+" + shape,
-            "suf1=" + normal[-1:],
-            "suf2=" + normal[-2:],
-            "suf3=" + normal[-3:],
-            "suf4=" + normal[-4:],
-            "suf5=" + normal[-5:],
-            "pre1=" + normal[:1],
-            "pre2=" + normal[:2],
-            "pre3=" + normal[:3],
-            "pre4=" + normal[:4],
-            "first_word=" + str(i == 1) + "+" + shape[:1],
-            "last_word=" + str(i == n) + "+" + shape[:1],
-            "t-1=" + previous_tag,
-            "t-2=" + previous_tag_2,
-            "t-2+t-1=" + previous_tag_2 + "+" + previous_tag,
-            "c-2+c-1=" + prev_c2 + "+" + prev_c1,
-            "t-1+w=" + previous_tag + "+" + normal,
-            "t-1+dom=" + previous_tag + "+" + dom0,
-            "t-1+amb=" + previous_tag + "+" + amb0,
-            "t-1+sig=" + previous_tag + "+" + sig,
+            "sig=" + sig0,
+            "p1=" + normal[:1],
+            "p2=" + normal[:2],
+            "p3=" + normal[:3],
+            "p4=" + normal[:4],
+            "s1=" + normal[-1:],
+            "s2=" + normal[-2:],
+            "s3=" + normal[-3:],
+            "s4=" + normal[-4:],
+            "s5=" + normal[-5:],
+            "cap=" + str(word[0].isupper() if word else False),
+            "allcap=" + str(word.isupper() if word else False),
+            "digit=" + str(any(c.isdigit() for c in word)),
+            "hyphen=" + str("-" in word),
+            "first_word=" + str(i == 1),
+            "last_word=" + str(i == n),
+
+            # Window words, stems, shapes & signatures
             "w-1=" + w_m1,
             "w-2=" + w_m2,
             "w-3=" + w_m3,
             "w+1=" + w_p1,
             "w+2=" + w_p2,
             "w+3=" + w_p3,
+            "st-1+st0=" + st_m1 + "+" + stem0,
+            "st0+st+1=" + stem0 + "+" + st_p1,
+            "sh-1=" + sh_m1,
+            "sh+1=" + sh_p1,
+            "sig-1=" + sig_m1,
+            "sig+1=" + sig_p1,
+            "sh-1+sh0+sh+1=" + sh_m1 + "+" + shape + "+" + sh_p1,
+            "sig-1+sig0+sig+1=" + sig_m1 + "+" + sig0 + "+" + sig_p1,
+
+            # Word n-grams
             "w-1+w=" + w_m1 + "+" + normal,
             "w+w+1=" + normal + "+" + w_p1,
             "w-1+w+1=" + w_m1 + "+" + w_p1,
             "w-2+w-1=" + w_m2 + "+" + w_m1,
             "w+1+w+2=" + w_p1 + "+" + w_p2,
+            "w-2+w-1+w=" + w_m2 + "+" + w_m1 + "+" + normal,
             "w-1+w+w+1=" + w_m1 + "+" + normal + "+" + w_p1,
-            "w-1suf3=" + w_m1[-3:],
-            "w+1suf3=" + w_p1[-3:],
-            "sh-1+sh+sh+1=" + sh_m1 + "+" + shape + "+" + sh_p1,
+            "w+w+1+w+2=" + normal + "+" + w_p1 + "+" + w_p2,
+            "w+1+w+2+w+3=" + w_p1 + "+" + w_p2 + "+" + w_p3,
+
+            # History transitions
+            "t-1=" + previous_tag,
+            "t-2=" + previous_tag_2,
+            "t-2+t-1=" + previous_tag_2 + "+" + previous_tag,
+            "t-1+w=" + previous_tag + "+" + normal,
+            "t-1+st=" + previous_tag + "+" + stem0,
+            "t-2+t-1+w=" + previous_tag_2 + "+" + previous_tag + "+" + normal,
+            "t-1+s3=" + previous_tag + "+" + normal[-3:],
+            "t-1+shape=" + previous_tag + "+" + shape,
+            "t-1+sig=" + previous_tag + "+" + sig0,
+            "cg-1+w=" + prev_cg + "+" + normal,
+            "cg-2+cg-1+sig=" + prev2_cg + "+" + prev_cg + "+" + sig0,
+
+            # Empirical lexicon prior features
+            "dom0=" + dom0,
+            "amb0=" + amb0,
+            "crs0=" + crs0,
+            "clu0=" + clu0,
+            "fb0=" + fb0 + "+" + dom0,
             "dom-1=" + dom_m1,
             "dom+1=" + dom_p1,
+            "dom-2=" + dom_m2,
             "dom+2=" + dom_p2,
             "amb-1=" + amb_m1,
             "amb+1=" + amb_p1,
-            "amb-1+amb0=" + amb_m1 + "+" + amb0,
+            "amb0+w-1=" + amb0 + "+" + w_m1,
+            "amb0+w+1=" + amb0 + "+" + w_p1,
+            "amb0+crs-1=" + amb0 + "+" + crs_m1,
+            "amb0+crs+1=" + amb0 + "+" + crs_p1,
             "amb0+amb+1=" + amb0 + "+" + amb_p1,
-            "crs-1+crs0=" + crs_m1 + "+" + crs0,
-            "crs0+crs+1=" + crs0 + "+" + crs_p1,
+            "amb-1+amb0=" + amb_m1 + "+" + amb0,
             "crs-1+crs0+crs+1=" + crs_m1 + "+" + crs0 + "+" + crs_p1,
             "crs0+crs+1+crs+2=" + crs0 + "+" + crs_p1 + "+" + crs_p2,
             "crs-2+crs-1+crs0=" + crs_m2 + "+" + crs_m1 + "+" + crs0,
@@ -217,6 +371,7 @@ class Tagger:
                 "p+2=" + p_r2,
                 "p+3=" + p_r3,
                 "p+w=" + p0 + "+" + normal,
+                "p+st=" + p0 + "+" + stem0,
                 "p+1+w=" + p_r1 + "+" + normal,
                 "p-1+w=" + p_l1 + "+" + normal,
                 "p+w+1=" + p0 + "+" + w_p1,
@@ -234,6 +389,19 @@ class Tagger:
                 "d0+d+1=" + d0 + "+" + d_r1,
                 "p0+amb0=" + p0 + "+" + amb0,
             ])
+
+            if global_ctx is not None:
+                off_root, off_l_cl, off_r_cl, off_l_nom, off_r_nom, n_roots = global_ctx
+                features.extend([
+                    "g_root=" + off_root[i] + "+" + c0,
+                    "g_root_p=" + off_root[i] + "+" + p0 + "+" + n_roots,
+                    "g_lcl=" + off_l_cl[i] + "+" + c0,
+                    "g_rcl=" + off_r_cl[i] + "+" + c0,
+                    "g_cl_span=" + off_l_cl[i] + "+" + p0 + "+" + off_r_cl[i],
+                    "g_lnom=" + off_l_nom[i] + "+" + c0,
+                    "g_rnom=" + off_r_nom[i] + "+" + c0,
+                    "g_nom_span=" + off_l_nom[i] + "+" + p0 + "+" + off_r_nom[i],
+                ])
 
             if backward_tags is not None:
                 b0 = backward_tags[i]
@@ -267,7 +435,12 @@ class Tagger:
         Tag one sentence. Returns a list of tags, with "<ROOT>" at position 0.
         Supports both left-to-right and right-to-left decoding.
         """
-        normal_words, shapes, sigs, priors = self._prepare_sentence(words)
+        normal_words, stems, shapes, sigs, priors = self._prepare_sentence(words)
+        global_ctx = (
+            _prepare_global_tag_context(first_tags, backward_tags)
+            if first_tags is not None
+            else None
+        )
         n = len(words) - 1
         tags = [None] * (n + 1)
         tags[0] = words[0]
@@ -285,6 +458,7 @@ class Tagger:
             features = self.get_features(
                 words,
                 normal_words,
+                stems,
                 shapes,
                 sigs,
                 priors,
@@ -293,6 +467,7 @@ class Tagger:
                 previous_tag_2,
                 first_tags,
                 backward_tags,
+                global_ctx,
             )
             rows = self.model.feature_rows(features)
             scores = self.model.scores(rows)
@@ -389,81 +564,22 @@ def jackknife_tags(
                     train_part_bwd_tags.append(backward_tags_list[k])
 
         fold_lexicon = build_lexicon(train_part)
-        f_list = train_part_first_tags if first_tags_list is not None else None
-        b_list = train_part_bwd_tags if backward_tags_list is not None else None
         tagger = train_tagger(
             train_part,
             tag_names,
             epochs,
-            f_list,
-            fold_lexicon,
+            train_part_first_tags if first_tags_list is not None else None,
+            lexicon=fold_lexicon,
             direction=direction,
-            backward_tags_list=b_list,
+            backward_tags_list=train_part_bwd_tags if backward_tags_list is not None else None,
         )
-
         for k in held_out:
             first_tags = first_tags_list[k] if first_tags_list is not None else None
             bwd_tags = backward_tags_list[k] if backward_tags_list is not None else None
-            all_tags[k] = tagger.tag(sentences[k]["words"], None, first_tags, None, bwd_tags)
+            all_tags[k] = tagger.tag(
+                sentences[k]["words"],
+                first_tags=first_tags,
+                backward_tags=bwd_tags,
+            )
         print("    jackknife fold", fold + 1, "of", n_folds, "done")
     return all_tags
-
-
-def tag_accuracy(sentences, tags):
-    total = 0
-    correct = 0
-    for k in range(len(sentences)):
-        for i in range(1, len(sentences[k]["words"])):
-            total += 1
-            if tags[k][i] == sentences[k]["labels"][i]:
-                correct += 1
-    return 100.0 * correct / total
-
-
-def make_tag_targets(sentences):
-    """
-    The tags we teach the tagger: the relation of the word plus the side of
-    its head: "<" when the head is on the left, ">" when it is on the right.
-    The root word gets "root".
-    """
-    result = []
-    for sentence in sentences:
-        tags = [sentence["labels"][0]]
-        for i in range(1, len(sentence["words"])):
-            head = sentence["heads"][i]
-            tag = sentence["labels"][i]
-            if head != 0 and head < i:
-                tag = tag + "<"
-            elif head > i:
-                tag = tag + ">"
-            tags.append(tag)
-        new_sentence = {
-            "words": sentence["words"],
-            "labels": tags,
-        }
-        result.append(new_sentence)
-    return result
-
-
-def make_supertag_targets(sentences):
-    """
-    Supertags for each token: signed relative head-distance bucket + coarse
-    role of the head (e.g., '+1:NMOD', '-2:CLAUSE', 'ROOT:ROOT').
-    Gives the parser explicit lookahead on how far away a token's head lies.
-    """
-    result = []
-    for sentence in sentences:
-        words = sentence["words"]
-        heads = sentence["heads"]
-        labels = sentence["labels"]
-        stags = [ROOT_WORD]
-        for i in range(1, len(words)):
-            h = heads[i]
-            dist_b = head_offset_bucket(i, h)
-            head_cg = "ROOT" if h == 0 else coarse_group(labels[h])
-            stags.append(dist_b + ":" + head_cg)
-        result.append({
-            "words": words,
-            "labels": stags,
-        })
-    return result

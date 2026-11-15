@@ -1,7 +1,10 @@
 """
-Main script: trains the bidirectional two-pass tagger, head-offset supertagger,
-and heterogeneous (Arc-Hybrid + Arc-Eager, L-to-R + R-to-L) parser ensemble,
-and writes the submission file.
+Main script: trains the bidirectional two-pass tagger, global-context
+head-offset supertagger, global first-order Graph-MST structured perceptron,
+full-tree 2nd/3rd-order label classifier, and heterogeneous (Arc-Hybrid +
+Arc-Eager, L-to-R + R-to-L) graph-guided transition parser ensemble, then
+decodes the globally optimal parse tree via Chu-Liu/Edmonds Maximum Spanning
+Arborescence and writes the submission file.
 
     python train_and_predict.py           -> train on all training data,
                                              write outputs/submission.csv
@@ -10,11 +13,12 @@ and writes the submission file.
 
 Extra options (can be combined with --check):
     --one-parser       train only the first parser (fast, for experiments)
-    --no-second-pass   do not use the second-pass tagger & supertagger
+    --no-second-pass   do not use the second-pass tagger, supertagger & MST guide
     --no-copy          do not copy answers of sentences seen in training
 """
 
 import gc
+import math
 import os
 import random
 import sys
@@ -39,11 +43,18 @@ from tagger import (
 from parser import (
     Parser,
     ArcEagerParser,
+    GraphMSTParser,
+    FullTreeLabeler,
+    jackknife_mst,
+    chu_liu_edmonds,
     flip_sentence,
     flip_tags,
     flip_supertags,
+    flip_mst_info,
     flip_result,
 )
+
+import numpy as np
 
 
 # ----------------------------- settings -----------------------------
@@ -53,13 +64,13 @@ OUTPUT_FOLDER = "outputs"
 
 TAGGER_EPOCHS = 6
 SUPERTAGGER_EPOCHS = 5
+MST_EPOCHS = 7
+TREE_LABELER_EPOCHS = 5
 JACKKNIFE_FOLDS = 5
 PARSER_EPOCHS = 12
 
-# Heterogeneous parser ensemble:
+# Heterogeneous graph-guided transition parser ensemble:
 # (system_type, reading_direction, random_seed, vote_weight)
-# Combines bottom-up Arc-Hybrid and top-down Arc-Eager transition systems
-# in both Left-to-Right and Right-to-Left reading directions.
 PARSERS = [
     ("arc-hybrid", "left-to-right", 1, 1.35),
     ("arc-eager",  "left-to-right", 1, 1.25),
@@ -93,8 +104,8 @@ def make_tags(train_sentences, other_sentence_lists):
     (dev or test) with taggers trained on all training sentences:
       1. Pass-1 Forward (Left-to-Right) tagger
       2. Pass-1 Backward (Right-to-Left) tagger
-      3. Pass-2 Stacked tagger conditioned on both Forward and Backward Pass-1 tags
-      4. Relative head-offset supertagger conditioned on Pass-2 and Backward tags
+      3. Pass-2 Stacked tagger conditioned on Forward + Backward tags + Global Clause/Root Lookahead
+      4. Relative head-offset supertagger conditioned on Pass-2 + Backward tags + Global Lookahead
     """
     tag_sentences = make_tag_targets(train_sentences)
     tag_names = get_label_names(tag_sentences)
@@ -134,7 +145,7 @@ def make_tags(train_sentences, other_sentence_lists):
     tagger_bwd = None
     gc.collect()
 
-    # ----- second pass: stacked bidirectional tagger -----
+    # ----- second pass: stacked bidirectional tagger with global lookahead -----
     print("Training the second-pass bidirectional tagger (jackknifing)...")
     train_tags_2 = jackknife_tags(
         tag_sentences,
@@ -213,6 +224,51 @@ def make_tags(train_sentences, other_sentence_lists):
     return train_tags_2, other_tags_lists_2, train_supertags, other_super_lists
 
 
+def make_mst_guides(train_sentences, train_tags, train_supertags, other_sentence_lists, other_tags_lists, other_super_lists, lexicon_ltr):
+    """
+    Train the Global First-Order Graph-Based MST Structured Perceptron:
+      - 5-fold jackknifing on `train_sentences` for zero-leakage stacking
+      - full training on all `train_sentences` for `other_sentence_lists`
+    """
+    if not USE_SECOND_PASS_TAGGER:
+        empty_other = [[None] * len(s) for s in other_sentence_lists]
+        return [None] * len(train_sentences), empty_other
+
+    print("Training the global Graph-MST parser (jackknifing for training data)...")
+    train_mst = jackknife_mst(
+        train_sentences,
+        train_tags,
+        train_supertags,
+        epochs=MST_EPOCHS,
+        n_folds=JACKKNIFE_FOLDS,
+    )
+    mst_train_heads = [m["heads"] for m in train_mst]
+    dummy_labels = [["root"] * len(s["words"]) for s in train_sentences]
+    mst_uas, _ = accuracy(train_sentences, mst_train_heads, dummy_labels)
+    print("    global Graph-MST UAS on training data (jackknifed): %.2f" % mst_uas)
+
+    print("Training the global Graph-MST parser on all training sentences...")
+    mst_model = GraphMSTParser(lexicon=lexicon_ltr)
+    mst_model.train(train_sentences, train_tags, train_supertags, epochs=MST_EPOCHS, seed=1)
+    other_mst_lists = []
+    for j in range(len(other_sentence_lists)):
+        sentences = other_sentence_lists[j]
+        t_list = other_tags_lists[j]
+        s_list = other_super_lists[j]
+        m_list = [
+            mst_model.predict_mst_info(
+                sentences[k]["words"],
+                t_list[k],
+                s_list[k] if s_list is not None else None,
+            )
+            for k in range(len(sentences))
+        ]
+        other_mst_lists.append(m_list)
+    mst_model = None
+    gc.collect()
+    return train_mst, other_mst_lists
+
+
 def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
     """
     If a sentence has the same words (or unambiguous normalized words) as a
@@ -273,29 +329,35 @@ def train_one_parser(
     train_sentences,
     train_tags,
     train_supertags,
+    train_mst,
     sentence_lists,
     tags_lists,
     supertags_lists,
+    mst_lists,
     lexicon_ltr=None,
     lexicon_rtl=None,
 ):
-    """Train one parser (Arc-Hybrid or Arc-Eager) and return its (heads, labels)."""
+    """Train one parser (Arc-Hybrid or Arc-Eager) and return its (heads, labels, margins)."""
     if direction == "right-to-left":
         sentences_for_training = []
         tags_for_training = []
         super_for_training = []
+        mst_for_training = []
         for k in range(len(train_sentences)):
             sentences_for_training.append(flip_sentence(train_sentences[k]))
             tags_for_training.append(flip_tags(train_tags[k]))
-            if train_supertags[k] is not None:
-                super_for_training.append(flip_supertags(train_supertags[k]))
-            else:
-                super_for_training.append(None)
+            super_for_training.append(
+                flip_supertags(train_supertags[k]) if train_supertags[k] is not None else None
+            )
+            mst_for_training.append(
+                flip_mst_info(train_mst[k]) if train_mst[k] is not None else None
+            )
         lexicon = lexicon_rtl
     else:
         sentences_for_training = train_sentences
         tags_for_training = train_tags
         super_for_training = train_supertags
+        mst_for_training = train_mst
         lexicon = lexicon_ltr
 
     if system_type == "arc-eager":
@@ -310,6 +372,7 @@ def train_one_parser(
             tags_for_training,
             random_generator,
             super_for_training,
+            mst_for_training,
             epoch=epoch,
         )
         print("    epoch", epoch + 1, "of", PARSER_EPOCHS, "done")
@@ -320,63 +383,37 @@ def train_one_parser(
         sentences = sentence_lists[j]
         tags_list = tags_lists[j]
         super_list = supertags_lists[j]
+        mst_list = mst_lists[j]
         all_heads = []
         all_labels = []
+        all_margins = []
         for k in range(len(sentences)):
             stags = super_list[k] if super_list is not None else None
+            minfo = mst_list[k] if mst_list is not None else None
             if direction == "right-to-left":
                 flipped = flip_sentence(sentences[k])
                 f_tags = flip_tags(tags_list[k])
                 f_stags = flip_supertags(stags) if stags is not None else None
-                heads, labels = parser.parse(flipped["words"], f_tags, False, f_stags)
-                heads, labels = flip_result(heads, labels)
+                f_minfo = flip_mst_info(minfo) if minfo is not None else None
+                heads, labels, margins = parser.parse(
+                    flipped["words"], f_tags, False, f_stags, f_minfo
+                )
+                heads, labels, margins = flip_result(heads, labels, margins)
             else:
-                heads, labels = parser.parse(sentences[k]["words"], tags_list[k], False, stags)
+                heads, labels, margins = parser.parse(
+                    sentences[k]["words"], tags_list[k], False, stags, minfo
+                )
             all_heads.append(heads)
             all_labels.append(labels)
-        results.append((all_heads, all_labels))
+            all_margins.append(margins)
+        results.append((all_heads, all_labels, all_margins))
     return results
-
-
-def _best_label_for_head(head_idx, word_idx, predictions, weights, sentence_idx, fallback_label="dep"):
-    """Return the highest-weighted label for attaching `word_idx` to `head_idx`."""
-    if head_idx == 0:
-        return "root"
-    label_votes = {}
-    first_seen = {}
-    for m, (all_heads, all_labels) in enumerate(predictions):
-        if all_heads[sentence_idx][word_idx] == head_idx:
-            lab = all_labels[sentence_idx][word_idx]
-            if lab == "root":
-                continue
-            label_votes[lab] = label_votes.get(lab, 0.0) + weights[m]
-            if lab not in first_seen:
-                first_seen[lab] = m
-    if label_votes:
-        return max(label_votes.keys(), key=lambda l: (label_votes[l], -first_seen[l]))
-    any_votes = {}
-    for m, (_, all_labels) in enumerate(predictions):
-        lab = all_labels[sentence_idx][word_idx]
-        if lab != "root":
-            any_votes[lab] = any_votes.get(lab, 0.0) + weights[m]
-    if any_votes:
-        return max(any_votes.keys(), key=lambda l: any_votes[l])
-    return fallback_label
 
 
 def _refine_ud_tree(words, heads, labels):
     """
     Apply deterministic Universal Dependencies v2 structural consistency rules
-    to the voted parse tree:
-      1. Pure punctuation tokens (never at root) always take label `punct`.
-      2. Prepositional phrases (`case` child present) modifying a pure nominal
-         argument (`obj`, `iobj`, `nsubj`, `nsubj:pass`, `nmod`, `nmod:poss`,
-         `compound`, `appos` without copula/auxiliary/subject children) take
-         `nmod` rather than `obl`; possessive `'s` phrases preceding their head
-         take `nmod:poss`.
-      3. Multi-word proper names (`flat`): if token `i+1` attaches to `i-1` as
-         `flat` and intervening capitalized proper name `i` was attached to
-         `i+1` or `i-1` as `case`/`compound`/`dep`, attach `i` to `i-1` as `flat`.
+    to the globally decoded parse tree.
     """
     n = len(words) - 1
     if n <= 0:
@@ -387,7 +424,7 @@ def _refine_ud_tree(words, heads, labels):
         if heads[i] != 0 and is_punct_word(words[i]):
             labels[i] = "punct"
 
-    # 2. Multi-word proper noun (`flat`) continuity (e.g., "Mary Jo Foley")
+    # 2. Multi-word proper noun (`flat`) continuity
     for i in range(2, n):
         if heads[i + 1] == i - 1 and labels[i + 1] == "flat":
             w_i = words[i]
@@ -396,7 +433,6 @@ def _refine_ud_tree(words, heads, labels):
                     heads[i] = i - 1
                     labels[i] = "flat"
 
-    # Build child lists for structural label checks
     children = [[] for _ in range(n + 1)]
     for i in range(1, n + 1):
         h = heads[i]
@@ -417,7 +453,6 @@ def _refine_ud_tree(words, heads, labels):
         if not case_children:
             continue
 
-        # Check possessive clitic `'s`
         has_poss_case = any(
             normalize_word(words[c]) in ("'s", "'") for c in case_children
         )
@@ -425,7 +460,6 @@ def _refine_ud_tree(words, heads, labels):
             labels[i] = "nmod:poss"
             continue
 
-        # Check PP attached as `obl` to a pure nominal head
         h = heads[i]
         if labels[i] == "obl" and 1 <= h <= n and labels[h] in nominal_head_labels:
             head_is_predicate = any(labels[ch] in clausal_child_labels for ch in children[h])
@@ -435,173 +469,143 @@ def _refine_ud_tree(words, heads, labels):
     return heads, labels
 
 
-def _enforce_valid_tree(
-    words, heads, labels, head_votes_per_word, predictions, weights, sentence_idx
+def vote(
+    predictions,
+    sentences,
+    weights=None,
+    tags_list=None,
+    supertags_list=None,
+    mst_list=None,
+    tree_labeler=None,
 ):
     """
-    Ensure the voted dependency graph is a valid single-root, cycle-free UD tree:
-      1. Pure punctuation tokens do not serve as heads of non-punctuation tokens.
-      2. Exactly one word has head == 0 (with label 'root').
-      3. No non-root word has label 'root'.
-      4. Any directed cycles are broken by switching the weakest cycle arc to
-         its best outside head.
-      5. Post-hoc UD v2 structural label consistency refinement.
-    """
-    n = len(heads) - 1
-    if n <= 0:
-        return heads, labels
-
-    punct_flags = [False] * (n + 1)
-    for i in range(1, n + 1):
-        punct_flags[i] = is_punct_word(words[i])
-
-    # 1. Prevent non-punctuation words from attaching to punctuation heads
-    if not all(punct_flags[1:]):
-        for i in range(1, n + 1):
-            h = heads[i]
-            if not punct_flags[i] and h > 0 and punct_flags[h]:
-                valid_cands = {
-                    cand_h: v
-                    for cand_h, v in head_votes_per_word[i].items()
-                    if cand_h != i and (cand_h == 0 or not punct_flags[cand_h])
-                }
-                if valid_cands:
-                    new_h = max(valid_cands.keys(), key=lambda ch: valid_cands[ch])
-                    heads[i] = new_h
-                    labels[i] = _best_label_for_head(new_h, i, predictions, weights, sentence_idx)
-
-    # 2. Enforce exactly one root (head == 0), preferring non-punctuation tokens
-    roots = [i for i in range(1, n + 1) if heads[i] == 0]
-    non_punct_roots = [i for i in roots if not punct_flags[i]]
-    if non_punct_roots:
-        best_r = max(non_punct_roots, key=lambda i: head_votes_per_word[i].get(0, 0.0))
-    elif len(roots) > 0:
-        best_r = max(roots, key=lambda i: head_votes_per_word[i].get(0, 0.0))
-    else:
-        cands = [i for i in range(1, n + 1) if not punct_flags[i]] or list(range(1, n + 1))
-        best_r = max(cands, key=lambda i: head_votes_per_word[i].get(0, -1.0))
-
-    for i in roots:
-        if i != best_r:
-            non_zero = {
-                h: v
-                for h, v in head_votes_per_word[i].items()
-                if h != 0 and h != i and (punct_flags[i] or not punct_flags[h])
-            }
-            if non_zero:
-                new_h = max(non_zero.keys(), key=lambda h: non_zero[h])
-            else:
-                new_h = best_r
-            heads[i] = new_h
-            labels[i] = _best_label_for_head(new_h, i, predictions, weights, sentence_idx)
-
-    heads[best_r] = 0
-    labels[best_r] = "root"
-    root_idx = best_r
-
-    # Ensure no non-root token has label == "root"
-    for i in range(1, n + 1):
-        if i != root_idx and labels[i] == "root":
-            labels[i] = _best_label_for_head(heads[i], i, predictions, weights, sentence_idx)
-
-    # 3. Break any directed cycles
-    for _ in range(n + 1):
-        visited = [0] * (n + 1)
-        visited[0] = 2
-        cycle_nodes = None
-
-        for start in range(1, n + 1):
-            if visited[start] != 0:
-                continue
-            path = []
-            curr = start
-            while curr != 0 and visited[curr] == 0:
-                visited[curr] = 1
-                path.append(curr)
-                curr = heads[curr]
-            if curr != 0 and visited[curr] == 1:
-                idx = path.index(curr)
-                cycle_nodes = set(path[idx:])
-                break
-            for node in path:
-                visited[node] = 2
-
-        if not cycle_nodes:
-            break
-
-        best_change = None
-        best_loss = 1e9
-        for u in cycle_nodes:
-            current_score = head_votes_per_word[u].get(heads[u], 0.0)
-            for cand_h, cand_score in head_votes_per_word[u].items():
-                if cand_h == 0 or cand_h == u or cand_h in cycle_nodes:
-                    continue
-                if not punct_flags[u] and punct_flags[cand_h]:
-                    continue
-                anc = cand_h
-                ok = True
-                steps = 0
-                while anc != 0 and steps <= n:
-                    if anc in cycle_nodes:
-                        ok = False
-                        break
-                    anc = heads[anc]
-                    steps += 1
-                if ok and anc == 0:
-                    loss = current_score - cand_score
-                    if loss < best_loss:
-                        best_loss = loss
-                        best_change = (u, cand_h)
-
-        if best_change is not None:
-            u, new_h = best_change
-        else:
-            u = min(cycle_nodes, key=lambda node: head_votes_per_word[node].get(heads[node], 0.0))
-            new_h = root_idx
-        heads[u] = new_h
-        labels[u] = _best_label_for_head(new_h, u, predictions, weights, sentence_idx)
-
-    return _refine_ud_tree(words, heads, labels)
-
-
-def vote(predictions, sentences, weights=None):
-    """
-    Combine the answers of several parsers using weighted voting,
-    global single-root cycle-free tree enforcement, and UD label refinement.
+    Combine all parsers via:
+      1. Margin-confidence-weighted arc score matrix construction (combining all
+         transition parsers + the Global Graph-MST parser).
+      2. Exact single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding.
+      3. Full-tree 2nd/3rd-order label scoring (`FullTreeLabeler`) blended with
+         the transition ensemble's confidence-weighted label votes.
+      4. Universal Dependencies v2 structural consistency refinement.
     """
     if weights is None:
         weights = [1.0] * len(predictions)
 
     voted_heads = []
     voted_labels = []
+
     for k in range(len(sentences)):
         words = sentences[k]["words"]
-        heads = [-1]
-        labels = [""]
-        head_votes_per_word = [{}]
         n = len(words) - 1
+        if n <= 0:
+            voted_heads.append([-1])
+            voted_labels.append([""])
+            continue
 
+        punct_flags = [False] + [is_punct_word(words[i]) for i in range(1, n + 1)]
+        all_punct = all(punct_flags[1:])
+
+        # Build (n + 1) x (n + 1) global arc score matrix
+        arc_scores = np.full((n + 1, n + 1), -1.0e4, dtype=np.float64)
+        for h in range(n + 1):
+            for m in range(1, n + 1):
+                if h == m:
+                    continue
+                if not all_punct and h > 0 and punct_flags[h] and not punct_flags[m]:
+                    arc_scores[h, m] = -1.0e6
+                elif not all_punct and h == 0 and punct_flags[m]:
+                    arc_scores[h, m] = -1.0e5
+                else:
+                    arc_scores[h, m] = 0.0
+
+        # Add confidence-weighted votes from every transition parser
+        for p_idx, pred_tuple in enumerate(predictions):
+            all_heads = pred_tuple[0]
+            all_margins = pred_tuple[2] if len(pred_tuple) > 2 else None
+            w_p = weights[p_idx]
+            for i in range(1, n + 1):
+                h = all_heads[k][i]
+                if 0 <= h <= n and h != i:
+                    marg = all_margins[k][i] if all_margins is not None else 4.0
+                    conf_mult = 0.85 + 0.30 * (min(max(marg, 0.0), 12.0) / 12.0)
+                    # Small deterministic tie-break favoring earlier parsers
+                    arc_scores[h, i] += w_p * conf_mult - 1.0e-5 * p_idx
+
+        # Add Global Graph-MST structural votes when available
+        if mst_list is not None and mst_list[k] is not None:
+            minfo = mst_list[k]
+            mh1 = minfo["heads"]
+            mh2 = minfo["heads2"]
+            mconf = minfo["conf"]
+            for i in range(1, n + 1):
+                h1 = mh1[i]
+                h2 = mh2[i]
+                if 0 <= h1 <= n and h1 != i:
+                    bonus = 0.95 if mconf[i] == "HIGH" else (0.65 if mconf[i] == "MID" else 0.40)
+                    arc_scores[h1, i] += bonus
+                if 0 <= h2 <= n and h2 != i:
+                    arc_scores[h2, i] += 0.20
+
+        # Decode exact single-root Maximum Spanning Arborescence via Chu-Liu/Edmonds
+        heads = chu_liu_edmonds(arc_scores)
+
+        # Compute full-tree label scores when `tree_labeler` is available
+        tree_scores = None
+        if tree_labeler is not None and tags_list is not None:
+            stags = supertags_list[k] if supertags_list is not None else None
+            tree_scores = tree_labeler.score_sentence_labels(words, tags_list[k], stags, heads)
+
+        labels = [""] * (n + 1)
         for i in range(1, n + 1):
-            head_votes = {}
-            first_seen_h = {}
-            for m, (all_heads, _) in enumerate(predictions):
-                head = all_heads[k][i]
-                head_votes[head] = head_votes.get(head, 0.0) + weights[m]
-                if head not in first_seen_h:
-                    first_seen_h[head] = m
-            head_votes_per_word.append(head_votes)
+            h = heads[i]
+            if h == 0:
+                labels[i] = "root"
+                continue
 
-            best_head = max(head_votes.keys(), key=lambda h: (head_votes[h], -first_seen_h[h]))
-            best_label = _best_label_for_head(best_head, i, predictions, weights, k)
+            label_votes = {}
+            first_seen = {}
+            for p_idx, pred_tuple in enumerate(predictions):
+                all_heads = pred_tuple[0]
+                all_labels = pred_tuple[1]
+                all_margins = pred_tuple[2] if len(pred_tuple) > 2 else None
+                lab = all_labels[k][i]
+                if lab == "root":
+                    continue
+                w_p = weights[p_idx]
+                marg = all_margins[k][i] if all_margins is not None else 4.0
+                conf_mult = 0.85 + 0.30 * (min(max(marg, 0.0), 12.0) / 12.0)
+                if all_heads[k][i] == h:
+                    vote_w = w_p * conf_mult
+                else:
+                    vote_w = 0.22 * w_p
+                label_votes[lab] = label_votes.get(lab, 0.0) + vote_w
+                if lab not in first_seen:
+                    first_seen[lab] = p_idx
 
-            heads.append(best_head)
-            labels.append(best_label)
+            if tree_scores is not None and tree_scores[i] is not None:
+                t_map = tree_scores[i]
+                if t_map:
+                    max_ts = max(t_map.values())
+                    for lab, ts in t_map.items():
+                        diff = ts - max_ts
+                        if diff >= -8.0:
+                            bonus = 1.15 * math.exp(0.25 * diff)
+                            label_votes[lab] = label_votes.get(lab, 0.0) + bonus
+                            if lab not in first_seen:
+                                first_seen[lab] = len(predictions)
 
-        heads, labels = _enforce_valid_tree(
-            words, heads, labels, head_votes_per_word, predictions, weights, k
-        )
+            if label_votes:
+                best_lab = max(
+                    label_votes.keys(),
+                    key=lambda l: (label_votes[l], -first_seen.get(l, 999)),
+                )
+            else:
+                best_lab = "dep"
+            labels[i] = best_lab
+
+        heads, labels = _refine_ud_tree(words, heads, labels)
         voted_heads.append(heads)
         voted_labels.append(labels)
+
     return voted_heads, voted_labels
 
 
@@ -633,6 +637,35 @@ def check_mode(all_train):
         flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
     lexicon_rtl = build_lexicon(flipped_tag_Target)
 
+    train_mst, other_mst = make_mst_guides(
+        train_sentences,
+        train_tags,
+        train_supertags,
+        [dev_sentences],
+        [dev_tags],
+        [dev_supertags],
+        lexicon_ltr,
+    )
+    dev_mst = other_mst[0]
+    if USE_SECOND_PASS_TAGGER:
+        dev_mst_heads = [m["heads"] for m in dev_mst]
+        dummy_labels = [["root"] * len(s["words"]) for s in dev_sentences]
+        mst_dev_uas, _ = accuracy(dev_sentences, dev_mst_heads, dummy_labels)
+        print("    global Graph-MST UAS on check data: %.2f" % mst_dev_uas)
+
+    tree_labeler = None
+    if USE_SECOND_PASS_TAGGER:
+        print("Training the full-tree 2nd/3rd-order labeler...")
+        tree_labeler = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
+        tree_labeler.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            epochs=TREE_LABELER_EPOCHS,
+            seed=1,
+        )
+
     predictions = []
     weights = []
     for (system_type, direction, seed, weight) in PARSERS:
@@ -648,9 +681,11 @@ def check_mode(all_train):
             train_sentences,
             train_tags,
             train_supertags,
+            train_mst,
             [dev_sentences],
             [dev_tags],
             [dev_supertags],
+            [dev_mst],
             lexicon_ltr=lexicon_ltr,
             lexicon_rtl=lexicon_rtl,
         )
@@ -659,9 +694,17 @@ def check_mode(all_train):
         gc.collect()
         uas, las = accuracy(dev_sentences, results[0][0], results[0][1])
         print("    this parser:      UAS %.2f  LAS %.2f" % (uas, las))
-        voted_heads, voted_labels = vote(predictions, dev_sentences, weights)
+        voted_heads, voted_labels = vote(
+            predictions,
+            dev_sentences,
+            weights,
+            tags_list=dev_tags,
+            supertags_list=dev_supertags,
+            mst_list=dev_mst,
+            tree_labeler=tree_labeler,
+        )
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
-        print("    vote of %d parsers: UAS %.2f  LAS %.2f   <- LAS is the competition score" % (len(predictions), uas, las))
+        print("    Chu-Liu/Edmonds ensemble (%d parsers + MST): UAS %.2f  LAS %.2f   <- LAS is the competition score" % (len(predictions), uas, las))
 
     if COPY_KNOWN_SENTENCES:
         copied = copy_known_sentences(train_sentences, dev_sentences, voted_heads, voted_labels)
@@ -688,6 +731,30 @@ def final_mode(train_sentences):
         flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
     lexicon_rtl = build_lexicon(flipped_tag_Target)
 
+    train_mst, other_mst = make_mst_guides(
+        train_sentences,
+        train_tags,
+        train_supertags,
+        [test_sentences],
+        [test_tags],
+        [test_supertags],
+        lexicon_ltr,
+    )
+    test_mst = other_mst[0]
+
+    tree_labeler = None
+    if USE_SECOND_PASS_TAGGER:
+        print("Training the full-tree 2nd/3rd-order labeler...")
+        tree_labeler = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
+        tree_labeler.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            epochs=TREE_LABELER_EPOCHS,
+            seed=1,
+        )
+
     test_predictions = []
     weights = []
     for (system_type, direction, seed, weight) in PARSERS:
@@ -703,9 +770,11 @@ def final_mode(train_sentences):
             train_sentences,
             train_tags,
             train_supertags,
+            train_mst,
             [test_sentences],
             [test_tags],
             [test_supertags],
+            [test_mst],
             lexicon_ltr=lexicon_ltr,
             lexicon_rtl=lexicon_rtl,
         )
@@ -713,14 +782,20 @@ def final_mode(train_sentences):
         weights.append(weight)
         gc.collect()
 
-    test_heads, test_labels = vote(test_predictions, test_sentences, weights)
+    test_heads, test_labels = vote(
+        test_predictions,
+        test_sentences,
+        weights,
+        tags_list=test_tags,
+        supertags_list=test_supertags,
+        mst_list=test_mst,
+        tree_labeler=tree_labeler,
+    )
     if COPY_KNOWN_SENTENCES:
         copied = copy_known_sentences(train_sentences, test_sentences, test_heads, test_labels)
         print("Copied the training answer for", copied, "test sentences")
 
     # Collect "HEAD|LABEL" for every row ID.
-    # For training IDs present in sample.csv, use their exact ground-truth
-    # labels from train.csv; for test IDs, use the ensemble's predictions.
     answer_of_id = {}
     for k in range(len(test_sentences)):
         for i in range(1, len(test_sentences[k]["words"])):
