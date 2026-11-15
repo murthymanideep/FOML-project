@@ -2,16 +2,17 @@
 The tagger: gives every word a rich syntactic tag (and head-offset supertag)
 before parsing.
 
-Improvements over the baseline tagger:
-  1. Lexicon & distributional word priors (dominant tag, ambiguity class,
-     coarse syntactic group, context cluster, and morphological signature
-     fallback for OOV/rare words), computed strictly within each training fold.
-  2. Richer orthographic, affix (1..5 chars), word-shape, and 3-word window
-     context features, plus coarse-tag and direction-tag projections.
-  3. Max-margin perceptron updates and 10% scheduled sampling of predicted
-     history during training to prevent left-to-right exposure bias.
-  4. Second-pass bidirectional refinement tagger + relative head-offset
-     supertagger (`htags`) that predicts signed attachment distance buckets.
+Key capabilities:
+  1. Fold-safe lexicon & distributional word priors (dominant tag, ambiguity
+     class, coarse syntactic group, context cluster, and morphological
+     signature fallback for OOV/rare words and Proper Nouns).
+  2. Bidirectional Pass-1 tagging: trains BOTH a Left-to-Right (forward)
+     tagger and a Right-to-Left (backward) tagger so every word gets
+     predictions conditioned on both left history and right history.
+  3. Pass-2 stacked refinement tagger: combines forward Pass-1 tags,
+     backward Pass-1 tags, agreement indicators, and lexical context.
+  4. Relative head-offset supertagger (`htags`) that predicts signed
+     attachment distance buckets and head coarse categories.
 """
 
 import random
@@ -37,10 +38,11 @@ END = "<END>"
 
 class Tagger:
 
-    def __init__(self, tag_names, lexicon=None, n_rows=2 ** 20):
+    def __init__(self, tag_names, lexicon=None, direction="left-to-right", n_rows=2 ** 20):
         self.tag_names = tag_names
         self.tag_number = {name: k for k, name in enumerate(tag_names)}
         self.lexicon = lexicon
+        self.direction = direction
         self.model = AveragedPerceptron(len(tag_names), n_rows)
 
     def _prepare_sentence(self, words):
@@ -67,6 +69,7 @@ class Tagger:
         previous_tag,
         previous_tag_2,
         first_tags=None,
+        backward_tags=None,
     ):
         """Features for the word at position i (positions start at 1)."""
         n = len(words) - 1
@@ -76,7 +79,6 @@ class Tagger:
         sig = sigs[i]
         dom0, amb0, crs0, clu0, fb0 = priors[i]
 
-        # Neighbour words and their lexicon priors
         if i - 1 >= 1:
             w_m1 = normal_words[i - 1]
             sh_m1 = shapes[i - 1]
@@ -130,7 +132,6 @@ class Tagger:
             "fb=" + fb0,
             "dom+w=" + dom0 + "+" + normal,
             "amb+shape=" + amb0 + "+" + shape,
-            # Prefixes and suffixes (up to 5 chars)
             "suf1=" + normal[-1:],
             "suf2=" + normal[-2:],
             "suf3=" + normal[-3:],
@@ -142,7 +143,6 @@ class Tagger:
             "pre4=" + normal[:4],
             "first_word=" + str(i == 1) + "+" + shape[:1],
             "last_word=" + str(i == n) + "+" + shape[:1],
-            # Tag history
             "t-1=" + previous_tag,
             "t-2=" + previous_tag_2,
             "t-2+t-1=" + previous_tag_2 + "+" + previous_tag,
@@ -151,7 +151,6 @@ class Tagger:
             "t-1+dom=" + previous_tag + "+" + dom0,
             "t-1+amb=" + previous_tag + "+" + amb0,
             "t-1+sig=" + previous_tag + "+" + sig,
-            # Word context window
             "w-1=" + w_m1,
             "w-2=" + w_m2,
             "w-3=" + w_m3,
@@ -167,11 +166,13 @@ class Tagger:
             "w-1suf3=" + w_m1[-3:],
             "w+1suf3=" + w_p1[-3:],
             "sh-1+sh+sh+1=" + sh_m1 + "+" + shape + "+" + sh_p1,
-            # Lexicon prior context window (crucial for lookahead!)
             "dom-1=" + dom_m1,
             "dom+1=" + dom_p1,
             "dom+2=" + dom_p2,
+            "amb-1=" + amb_m1,
             "amb+1=" + amb_p1,
+            "amb-1+amb0=" + amb_m1 + "+" + amb0,
+            "amb0+amb+1=" + amb0 + "+" + amb_p1,
             "crs-1+crs0=" + crs_m1 + "+" + crs0,
             "crs0+crs+1=" + crs0 + "+" + crs_p1,
             "crs-1+crs0+crs+1=" + crs_m1 + "+" + crs0 + "+" + crs_p1,
@@ -182,9 +183,13 @@ class Tagger:
             "dom-1+dom0=" + dom_m1 + "+" + dom0,
             "dom0+w+1=" + dom0 + "+" + w_p1,
             "w+dom+1=" + normal + "+" + dom_p1,
+            "w-1+dom0=" + w_m1 + "+" + dom0,
             "t-1+w+1=" + previous_tag + "+" + w_p1,
+            "t-1+w-1=" + previous_tag + "+" + w_m1,
             "t-1+dom+1=" + previous_tag + "+" + dom_p1,
+            "t-1+dom-1=" + previous_tag + "+" + dom_m1,
             "t-1+crs0+crs+1=" + previous_tag + "+" + crs0 + "+" + crs_p1,
+            "t-1+crs-1+crs0=" + previous_tag + "+" + crs_m1 + "+" + crs0,
             "clu-1+clu0+clu+1=" + clu_m1 + "+" + clu0 + "+" + clu_p1,
             "pos=" + str(min(i, 5)) + "+" + str(min(n - i, 5)),
         ]
@@ -229,18 +234,54 @@ class Tagger:
                 "d0+d+1=" + d0 + "+" + d_r1,
                 "p0+amb0=" + p0 + "+" + amb0,
             ])
+
+            if backward_tags is not None:
+                b0 = backward_tags[i]
+                b_l1 = backward_tags[i - 1] if i - 1 >= 1 else START
+                b_r1 = backward_tags[i + 1] if i + 1 <= n else END
+                b_r2 = backward_tags[i + 2] if i + 2 <= n else END
+                bc0 = coarse_group(b0)
+                bc_r1 = coarse_group(b_r1)
+                agree0 = str(p0 == b0)
+                agree_r1 = str(p_r1 == b_r1)
+
+                features.extend([
+                    "b=" + b0,
+                    "b-1=" + b_l1,
+                    "b+1=" + b_r1,
+                    "b+2=" + b_r2,
+                    "p0+b0=" + p0 + "+" + b0,
+                    "agree0=" + agree0 + "+" + p0 + "+" + b0,
+                    "agree_r1=" + agree_r1 + "+" + p_r1 + "+" + b_r1,
+                    "b0+w=" + b0 + "+" + normal,
+                    "b-1+b0+b+1=" + b_l1 + "+" + b0 + "+" + b_r1,
+                    "b0+b+1+b+2=" + b0 + "+" + b_r1 + "+" + b_r2,
+                    "p-1+b0+b+1=" + p_l1 + "+" + b0 + "+" + b_r1,
+                    "t-1+b0+b+1=" + previous_tag + "+" + b0 + "+" + b_r1,
+                    "c0+bc0+bc_r1=" + c0 + "+" + bc0 + "+" + bc_r1,
+                ])
         return features
 
-    def tag(self, words, correct_tags=None, first_tags=None, rng=None):
+    def tag(self, words, correct_tags=None, first_tags=None, rng=None, backward_tags=None):
         """
         Tag one sentence. Returns a list of tags, with "<ROOT>" at position 0.
+        Supports both left-to-right and right-to-left decoding.
         """
         normal_words, shapes, sigs, priors = self._prepare_sentence(words)
+        n = len(words) - 1
+        tags = [None] * (n + 1)
+        tags[0] = words[0]
 
-        tags = [words[0]]
-        previous_tag = START
-        previous_tag_2 = START
-        for i in range(1, len(words)):
+        if self.direction == "right-to-left":
+            positions = range(n, 0, -1)
+            previous_tag = END
+            previous_tag_2 = END
+        else:
+            positions = range(1, n + 1)
+            previous_tag = START
+            previous_tag_2 = START
+
+        for i in positions:
             features = self.get_features(
                 words,
                 normal_words,
@@ -251,20 +292,19 @@ class Tagger:
                 previous_tag,
                 previous_tag_2,
                 first_tags,
+                backward_tags,
             )
             rows = self.model.feature_rows(features)
             scores = self.model.scores(rows)
 
             if correct_tags is not None:
                 correct = self.tag_number[correct_tags[i]]
-                # Max-margin loss-augmented inference during training
                 augmented = scores.copy()
                 augmented += 0.5
                 augmented[correct] -= 0.5
                 guess = int(augmented.argmax())
                 if guess != correct:
                     self.model.update(rows, correct, guess)
-                # 90% teacher forcing, 10% model prediction to reduce exposure bias
                 if rng is not None and rng.random() < 0.10:
                     guessed_tag = self.tag_names[int(scores.argmax())]
                 else:
@@ -273,12 +313,12 @@ class Tagger:
                 guess = int(scores.argmax())
                 guessed_tag = self.tag_names[guess]
 
-            tags.append(guessed_tag)
+            tags[i] = guessed_tag
             previous_tag_2 = previous_tag
             previous_tag = guessed_tag
         return tags
 
-    def train(self, sentences, epochs, seed=1, first_tags_list=None):
+    def train(self, sentences, epochs, seed=1, first_tags_list=None, backward_tags_list=None):
         """
         Train on sentences; the "labels" of the sentence are the tags to learn.
         """
@@ -289,20 +329,43 @@ class Tagger:
             for k in order:
                 sentence = sentences[k]
                 first_tags = first_tags_list[k] if first_tags_list is not None else None
-                self.tag(sentence["words"], sentence["labels"], first_tags, random_generator)
+                bwd_tags = backward_tags_list[k] if backward_tags_list is not None else None
+                self.tag(
+                    sentence["words"],
+                    sentence["labels"],
+                    first_tags,
+                    random_generator,
+                    bwd_tags,
+                )
                 self.model.next_step()
         self.model.average_weights()
 
 
-def train_tagger(sentences, tag_names, epochs, first_tags_list=None, lexicon=None):
+def train_tagger(
+    sentences,
+    tag_names,
+    epochs,
+    first_tags_list=None,
+    lexicon=None,
+    direction="left-to-right",
+    backward_tags_list=None,
+):
     if lexicon is None:
         lexicon = build_lexicon(sentences)
-    tagger = Tagger(tag_names, lexicon=lexicon)
-    tagger.train(sentences, epochs, 1, first_tags_list)
+    tagger = Tagger(tag_names, lexicon=lexicon, direction=direction)
+    tagger.train(sentences, epochs, 1, first_tags_list, backward_tags_list)
     return tagger
 
 
-def jackknife_tags(sentences, tag_names, epochs, n_folds=5, first_tags_list=None):
+def jackknife_tags(
+    sentences,
+    tag_names,
+    epochs,
+    n_folds=5,
+    first_tags_list=None,
+    direction="left-to-right",
+    backward_tags_list=None,
+):
     """
     Give tags to the TRAINING sentences using n_folds cross-validation
     so the parser learns with realistic tagger predictions and fold-specific
@@ -313,6 +376,7 @@ def jackknife_tags(sentences, tag_names, epochs, n_folds=5, first_tags_list=None
     for fold in range(n_folds):
         train_part = []
         train_part_first_tags = []
+        train_part_bwd_tags = []
         held_out = []
         for k in range(len(sentences)):
             if k % n_folds == fold:
@@ -321,16 +385,26 @@ def jackknife_tags(sentences, tag_names, epochs, n_folds=5, first_tags_list=None
                 train_part.append(sentences[k])
                 if first_tags_list is not None:
                     train_part_first_tags.append(first_tags_list[k])
+                if backward_tags_list is not None:
+                    train_part_bwd_tags.append(backward_tags_list[k])
 
         fold_lexicon = build_lexicon(train_part)
-        if first_tags_list is None:
-            tagger = train_tagger(train_part, tag_names, epochs, None, fold_lexicon)
-        else:
-            tagger = train_tagger(train_part, tag_names, epochs, train_part_first_tags, fold_lexicon)
+        f_list = train_part_first_tags if first_tags_list is not None else None
+        b_list = train_part_bwd_tags if backward_tags_list is not None else None
+        tagger = train_tagger(
+            train_part,
+            tag_names,
+            epochs,
+            f_list,
+            fold_lexicon,
+            direction=direction,
+            backward_tags_list=b_list,
+        )
 
         for k in held_out:
             first_tags = first_tags_list[k] if first_tags_list is not None else None
-            all_tags[k] = tagger.tag(sentences[k]["words"], None, first_tags)
+            bwd_tags = backward_tags_list[k] if backward_tags_list is not None else None
+            all_tags[k] = tagger.tag(sentences[k]["words"], None, first_tags, None, bwd_tags)
         print("    jackknife fold", fold + 1, "of", n_folds, "done")
     return all_tags
 

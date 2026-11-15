@@ -39,8 +39,62 @@ PRT_WORDS = {
 }
 PUNCT_TOKENS = {
     ".", ",", ":", ";", "!", "?", "-", "--", "---", "(", ")", "[", "]",
-    "{", "}", "\"", "'", "''", "``", "/", "\\", "...", "*", "&",
+    "{", "}", "\"", "'", "''", "``", "/", "\\", "...", "....", ".....",
+    "*", "&", "??", "???", "!!", "!!!", ":)", ":(", ";)", ":-)",
 }
+CLOSED_CLASS_WORDS = {
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
+    "her", "its", "our", "their", "some", "any", "no", "every", "each", "either",
+    "neither", "both", "all", "half", "several", "many", "much", "few", "little",
+    "other", "another", "such", "what", "whatever", "which", "whichever", "who",
+    "whom", "whose", "where", "when", "why", "how", "i", "you", "he", "she",
+    "it", "we", "they", "me", "him", "us", "them", "myself", "yourself",
+    "himself", "herself", "itself", "ourselves", "themselves", "someone",
+    "anyone", "everyone", "noone", "nobody", "anybody", "everybody", "somebody",
+    "something", "anything", "everything", "nothing", "one", "ones", "none",
+    "in", "on", "at", "to", "for", "with", "from", "by", "about", "as", "into",
+    "like", "through", "after", "over", "between", "out", "against", "during",
+    "without", "before", "under", "around", "among", "of", "off", "up", "down",
+    "near", "toward", "towards", "upon", "within", "along", "following", "across",
+    "behind", "beyond", "plus", "except", "but", "per", "via", "despite", "onto",
+    "throughout", "besides", "above", "below", "since", "until", "till", "while",
+    "although", "though", "because", "if", "unless", "whether", "whereas", "so",
+    "and", "or", "nor", "yet", "not", "n't", "never", "always", "also", "very",
+    "too", "just", "only", "even", "still", "already", "almost", "quite", "rather",
+    "here", "there", "now", "then", "today", "yesterday", "tomorrow", "again",
+    "ever", "perhaps", "maybe", "well", "however", "therefore", "thus", "instead",
+    "be", "am", "is", "are", "was", "were", "been", "being", "have", "has", "had",
+    "having", "do", "does", "did", "doing", "done", "will", "would", "shall",
+    "should", "can", "could", "may", "might", "must", "ca", "wo", "sha",
+    "'s", "'m", "'ve", "'re", "'ll", "'d",
+}
+
+# Stripped clitic normalization map (handles missing apostrophes in train/test)
+_STRIPPED_CLITICS = {
+    "s": "'s",
+    "’s": "'s",
+    "m": "'m",
+    "’m": "'m",
+    "ve": "'ve",
+    "’ve": "'ve",
+    "re": "'re",
+    "’re": "'re",
+    "ll": "'ll",
+    "’ll": "'ll",
+    "d": "'d",
+    "’d": "'d",
+    "nt": "n't",
+    "n’t": "n't",
+}
+
+
+def is_punct_word(word):
+    """Return True if the token is purely punctuation or an empty quote token."""
+    if word == ROOT_WORD:
+        return False
+    if word == "" or word in PUNCT_TOKENS:
+        return True
+    return not any(c.isalnum() for c in word)
 
 
 def make_empty_sentence(name):
@@ -125,12 +179,23 @@ def accuracy(sentences, predicted_heads, predicted_labels):
 
 
 def normalize_word(word):
-    """Lower-case a word and normalize numbers, years, ordinals, percentages, URLs."""
+    """
+    Lower-case a word and normalize stripped clitics, empty quotes, numbers,
+    years, ordinals, percentages, currencies, and URLs.
+    """
     if word == ROOT_WORD:
         return word
+    # Empty tokens in this dataset come from stripped single quotes (')
     if word == "":
-        return "<EMPTY>"
+        return "'"
+    # Normalize repeated quotes ("""" or '') to standard quote
+    if all(c in ('"', "'", "`") for c in word):
+        return '"'
+
     low = word.lower()
+    if low in _STRIPPED_CLITICS:
+        return _STRIPPED_CLITICS[low]
+
     if low.startswith("http://") or low.startswith("https://") or low.startswith("www."):
         return "<URL>"
     if "@" in low and "." in low and len(low) > 4:
@@ -160,6 +225,8 @@ def word_shape(word):
     other characters stay the same. Repeated symbols are written once.
     Example: "McDonald's" -> "XxXx'x",  "2026" -> "d",  "U.S." -> "X.X."
     """
+    if word == "":
+        return "'"
     shape = ""
     for character in word:
         if character.isupper():
@@ -207,20 +274,32 @@ _SUFFIX_CLASSES = (
 def word_signature(word, position=1):
     """
     Morphological & orthographic signature for rare/unseen word generalization.
-    Combines capitalization, digit/hyphen properties, and English suffix family.
+    Distinguishes Proper Nouns (MID_PROPN / INIT_PROPN) from capitalized
+    closed-class words and extracts suffix families.
     """
     if word == ROOT_WORD:
         return "ROOT"
-    if not word:
-        return "EMPTY"
+    if word == "" or is_punct_word(word):
+        return "PUNCT"
+
+    norm = normalize_word(word)
+    if norm in ("'s", "'m", "'ve", "'re", "'ll", "'d", "n't"):
+        return "CLITIC_" + norm
+
+    is_closed = norm in CLOSED_CLASS_WORDS
 
     # Capitalization
     if word.isupper() and any(c.isalpha() for c in word):
-        cap = "ALL_CAP"
+        cap = "ALL_CAP_CLOSED" if is_closed else "ALL_CAP_PROPN"
     elif word[0].isupper():
-        cap = "INIT_CAP" if position == 1 else "MID_CAP"
+        if is_closed:
+            cap = "CAP_CLOSED"
+        elif position == 1:
+            cap = "INIT_CAP_OPEN"
+        else:
+            cap = "MID_PROPN"
     elif any(c.isupper() for c in word):
-        cap = "MIX_CAP"
+        cap = "MIX_PROPN"
     else:
         cap = "LOW"
 
@@ -228,21 +307,20 @@ def word_signature(word, position=1):
     has_hyphen = "HYP" if ("-" in word and len(word) > 1) else ""
 
     low = word.lower()
-    # If hyphenated (e.g. "well-known"), inspect the head part after the last hyphen
     tail = low.rsplit("-", 1)[-1] if has_hyphen else low
 
     suf_class = "NONE"
-    if tail in ("'s", "'", "n't", "'re", "'ve", "'ll", "'d", "'m"):
-        suf_class = "CLITIC_" + tail
-    elif len(tail) >= 3:
+    if len(tail) >= 3:
         for suf, label in _SUFFIX_CLASSES:
             if tail.endswith(suf) and len(tail) > len(suf) + 1:
                 suf_class = label
                 break
         if suf_class == "NONE":
             suf_class = "END_" + tail[-2:]
-    elif not any(c.isalnum() for c in word):
-        suf_class = "PUNCT"
+    elif len(tail) == 2 and cap == "MID_PROPN":
+        suf_class = "SHORT_PROPN"
+    elif len(tail) == 1 and cap in ("MID_PROPN", "ALL_CAP_PROPN"):
+        suf_class = "INITIAL_PROPN"
 
     return cap + "|" + has_digit + "|" + has_hyphen + "|" + suf_class
 
@@ -343,7 +421,6 @@ def build_lexicon(sentences):
                 word_tag_counts[w] = counts
             counts[t] = counts.get(t, 0) + 1
 
-            # For rare words, accumulate morphological signature statistics
             sig = word_signature(words[i], i)
             scounts = sig_tag_counts.get(sig)
             if scounts is None:
@@ -352,7 +429,6 @@ def build_lexicon(sentences):
             scounts[t] = scounts.get(t, 0) + 1
 
             if i > 1:
-                lw = norms[i - 1]
                 lmap = left_context_counts.get(w)
                 if lmap is None:
                     lmap = {}
@@ -360,7 +436,6 @@ def build_lexicon(sentences):
                 lc = coarse_group(labels[i - 1])
                 lmap[lc] = lmap.get(lc, 0) + 1
             if i < n:
-                rw = norms[i + 1]
                 rmap = right_context_counts.get(w)
                 if rmap is None:
                     rmap = {}
@@ -380,7 +455,7 @@ def build_lexicon(sentences):
         dominant_tag[w] = best_tag
         dominant_coarse[w] = coarse_group(best_tag)
 
-        if len(sorted_tags) >= 2 and sorted_tags[1][1] >= 0.15 * total:
+        if len(sorted_tags) >= 2 and sorted_tags[1][1] >= 0.12 * total:
             ambiguity_class[w] = sorted_tags[0][0] + "/" + sorted_tags[1][0]
         else:
             ambiguity_class[w] = best_tag
@@ -397,7 +472,7 @@ def build_lexicon(sentences):
         sorted_tags = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         sig_dominant[sig] = sorted_tags[0][0]
         total = sum(counts.values())
-        if len(sorted_tags) >= 2 and sorted_tags[1][1] >= 0.20 * total:
+        if len(sorted_tags) >= 2 and sorted_tags[1][1] >= 0.18 * total:
             sig_ambiguity[sig] = sorted_tags[0][0] + "/" + sorted_tags[1][0]
         else:
             sig_ambiguity[sig] = sorted_tags[0][0]
@@ -424,7 +499,9 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
     total = lexicon["word_totals"].get(normal_word, 0)
     sig = word_signature(raw_word, position)
 
-    if total >= 2:
+    # If a word is capitalized mid-sentence (MID_PROPN) and rare in lowercase,
+    # prefer its Proper Noun signature over a rare lowercase occurrence.
+    if total >= 2 and not (sig.startswith("MID_PROPN") and total <= 3 and not raw_word.islower()):
         dom = lexicon["dominant_tag"][normal_word]
         amb = lexicon["ambiguity_class"][normal_word]
         crs = lexicon["dominant_coarse"][normal_word]
@@ -439,7 +516,6 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
             fb = "LOW"
         return (dom, amb, crs, clu, fb)
 
-    # Rare (count == 1) or unseen OOV word: fall back to morphological signature prior
     dom = lexicon["sig_dominant"].get(sig, "UNK")
     amb = lexicon["sig_ambiguity"].get(sig, "UNK")
     crs = coarse_group(dom) if dom != "UNK" else "UNK"

@@ -1,6 +1,7 @@
 """
-Main script: trains the two-pass tagger, head-offset supertagger, and
-directional parser ensemble, and writes the submission file.
+Main script: trains the bidirectional two-pass tagger, head-offset supertagger,
+and heterogeneous (Arc-Hybrid + Arc-Eager, L-to-R + R-to-L) parser ensemble,
+and writes the submission file.
 
     python train_and_predict.py           -> train on all training data,
                                              write outputs/submission.csv
@@ -25,6 +26,8 @@ from data_utils import (
     write_submission,
     accuracy,
     normalize_word,
+    is_punct_word,
+    build_lexicon,
 )
 from tagger import (
     train_tagger,
@@ -35,6 +38,7 @@ from tagger import (
 )
 from parser import (
     Parser,
+    ArcEagerParser,
     flip_sentence,
     flip_tags,
     flip_supertags,
@@ -52,18 +56,21 @@ SUPERTAGGER_EPOCHS = 5
 JACKKNIFE_FOLDS = 5
 PARSER_EPOCHS = 12
 
-# The parsers that vote: (reading direction, random seed, vote weight).
-# Left-to-right parsers are stronger than right-to-left parsers, so they
-# receive a higher vote weight while still benefiting from R-to-L diversity.
+# Heterogeneous parser ensemble:
+# (system_type, reading_direction, random_seed, vote_weight)
+# Combines bottom-up Arc-Hybrid and top-down Arc-Eager transition systems
+# in both Left-to-Right and Right-to-Left reading directions.
 PARSERS = [
-    ("left-to-right", 1, 1.30),
-    ("right-to-left", 1, 1.00),
-    ("left-to-right", 2, 1.25),
-    ("right-to-left", 2, 1.00),
-    ("left-to-right", 3, 1.25),
-    ("right-to-left", 3, 1.00),
-    ("left-to-right", 4, 1.25),
-    ("left-to-right", 5, 1.25),
+    ("arc-hybrid", "left-to-right", 1, 1.35),
+    ("arc-eager",  "left-to-right", 1, 1.25),
+    ("arc-hybrid", "right-to-left", 1, 1.05),
+    ("arc-hybrid", "left-to-right", 2, 1.30),
+    ("arc-eager",  "left-to-right", 2, 1.20),
+    ("arc-hybrid", "right-to-left", 2, 1.00),
+    ("arc-eager",  "right-to-left", 1, 0.95),
+    ("arc-hybrid", "left-to-right", 3, 1.30),
+    ("arc-hybrid", "left-to-right", 4, 1.30),
+    ("arc-eager",  "left-to-right", 3, 1.20),
 ]
 
 USE_SECOND_PASS_TAGGER = True
@@ -82,43 +89,82 @@ def get_label_names(sentences):
 
 def make_tags(train_sentences, other_sentence_lists):
     """
-    Tag the training sentences with jackknifing, and the other sentences
-    (dev or test) with a tagger trained on all training sentences.
-    Also trains a relative head-offset supertagger (`supertags`) when
-    second-pass tagging is enabled.
+    Tag the training sentences with 5-fold jackknifing, and the other sentences
+    (dev or test) with taggers trained on all training sentences:
+      1. Pass-1 Forward (Left-to-Right) tagger
+      2. Pass-1 Backward (Right-to-Left) tagger
+      3. Pass-2 Stacked tagger conditioned on both Forward and Backward Pass-1 tags
+      4. Relative head-offset supertagger conditioned on Pass-2 and Backward tags
     """
     tag_sentences = make_tag_targets(train_sentences)
     tag_names = get_label_names(tag_sentences)
 
-    print("Training the first-pass tagger (jackknifing for the training data)...")
-    train_tags = jackknife_tags(tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS)
-    print("    tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags))
+    print("Training the first-pass L-to-R tagger (jackknifing for training data)...")
+    train_tags_fwd = jackknife_tags(
+        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, direction="left-to-right"
+    )
+    print("    L-to-R tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_fwd))
 
-    print("Training the first-pass tagger on all training sentences...")
-    tagger = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS)
-    other_tags_lists = []
+    print("Training the first-pass L-to-R tagger on all training sentences...")
+    tagger_fwd = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, direction="left-to-right")
+    other_tags_fwd = []
     for sentences in other_sentence_lists:
-        tags_list = [tagger.tag(sentence["words"]) for sentence in sentences]
-        other_tags_lists.append(tags_list)
-    tagger = None
+        tags_list = [tagger_fwd.tag(sentence["words"]) for sentence in sentences]
+        other_tags_fwd.append(tags_list)
+    tagger_fwd = None
     gc.collect()
 
     if not USE_SECOND_PASS_TAGGER:
         empty_super = [[None] * len(s) for s in other_sentence_lists]
-        return train_tags, other_tags_lists, [None] * len(train_sentences), empty_super
+        return train_tags_fwd, other_tags_fwd, [None] * len(train_sentences), empty_super
 
-    # ----- second pass: fine directional tagger -----
-    print("Training the second-pass tagger (jackknifing)...")
-    train_tags_2 = jackknife_tags(tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, train_tags)
+    # ----- first-pass backward (Right-to-Left) tagger -----
+    print("Training the first-pass R-to-L tagger (jackknifing for training data)...")
+    train_tags_bwd = jackknife_tags(
+        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS, direction="right-to-left"
+    )
+    print("    R-to-L tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_bwd))
+
+    print("Training the first-pass R-to-L tagger on all training sentences...")
+    tagger_bwd = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, direction="right-to-left")
+    other_tags_bwd = []
+    for sentences in other_sentence_lists:
+        tags_list = [tagger_bwd.tag(sentence["words"]) for sentence in sentences]
+        other_tags_bwd.append(tags_list)
+    tagger_bwd = None
+    gc.collect()
+
+    # ----- second pass: stacked bidirectional tagger -----
+    print("Training the second-pass bidirectional tagger (jackknifing)...")
+    train_tags_2 = jackknife_tags(
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        JACKKNIFE_FOLDS,
+        first_tags_list=train_tags_fwd,
+        direction="left-to-right",
+        backward_tags_list=train_tags_bwd,
+    )
     print("    second-pass tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_2))
 
-    print("Training the second-pass tagger on all training sentences...")
-    tagger_2 = train_tagger(tag_sentences, tag_names, TAGGER_EPOCHS, train_tags)
+    print("Training the second-pass bidirectional tagger on all training sentences...")
+    tagger_2 = train_tagger(
+        tag_sentences,
+        tag_names,
+        TAGGER_EPOCHS,
+        first_tags_list=train_tags_fwd,
+        direction="left-to-right",
+        backward_tags_list=train_tags_bwd,
+    )
     other_tags_lists_2 = []
     for j in range(len(other_sentence_lists)):
         sentences = other_sentence_lists[j]
         tags_list = [
-            tagger_2.tag(sentences[k]["words"], None, other_tags_lists[j][k])
+            tagger_2.tag(
+                sentences[k]["words"],
+                first_tags=other_tags_fwd[j][k],
+                backward_tags=other_tags_bwd[j][k],
+            )
             for k in range(len(sentences))
         ]
         other_tags_lists_2.append(tags_list)
@@ -130,17 +176,34 @@ def make_tags(train_sentences, other_sentence_lists):
     super_names = get_label_names(super_sentences)
     print("Training the head-offset supertagger (jackknifing)...")
     train_supertags = jackknife_tags(
-        super_sentences, super_names, SUPERTAGGER_EPOCHS, JACKKNIFE_FOLDS, train_tags_2
+        super_sentences,
+        super_names,
+        SUPERTAGGER_EPOCHS,
+        JACKKNIFE_FOLDS,
+        first_tags_list=train_tags_2,
+        direction="left-to-right",
+        backward_tags_list=train_tags_bwd,
     )
     print("    supertag accuracy on training data (jackknifed): %.2f" % tag_accuracy(super_sentences, train_supertags))
 
     print("Training the head-offset supertagger on all training sentences...")
-    super_tagger = train_tagger(super_sentences, super_names, SUPERTAGGER_EPOCHS, train_tags_2)
+    super_tagger = train_tagger(
+        super_sentences,
+        super_names,
+        SUPERTAGGER_EPOCHS,
+        first_tags_list=train_tags_2,
+        direction="left-to-right",
+        backward_tags_list=train_tags_bwd,
+    )
     other_super_lists = []
     for j in range(len(other_sentence_lists)):
         sentences = other_sentence_lists[j]
         s_list = [
-            super_tagger.tag(sentences[k]["words"], None, other_tags_lists_2[j][k])
+            super_tagger.tag(
+                sentences[k]["words"],
+                first_tags=other_tags_lists_2[j][k],
+                backward_tags=other_tags_bwd[j][k],
+            )
             for k in range(len(sentences))
         ]
         other_super_lists.append(s_list)
@@ -179,7 +242,6 @@ def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
     for key, counts in exact_counts.items():
         sorted_ans = sorted(counts.items(), key=lambda kv: -kv[1])
         total = sum(counts.values())
-        # Accept majority answer if unambiguous or >= 75% majority
         if sorted_ans[0][1] >= 0.75 * total:
             exact_best[key] = (list(sorted_ans[0][0][0]), list(sorted_ans[0][0][1]))
 
@@ -204,6 +266,7 @@ def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
 
 
 def train_one_parser(
+    system_type,
     direction,
     seed,
     label_names,
@@ -213,8 +276,10 @@ def train_one_parser(
     sentence_lists,
     tags_lists,
     supertags_lists,
+    lexicon_ltr=None,
+    lexicon_rtl=None,
 ):
-    """Train one parser and return its (heads, labels) for each list of sentences."""
+    """Train one parser (Arc-Hybrid or Arc-Eager) and return its (heads, labels)."""
     if direction == "right-to-left":
         sentences_for_training = []
         tags_for_training = []
@@ -226,12 +291,18 @@ def train_one_parser(
                 super_for_training.append(flip_supertags(train_supertags[k]))
             else:
                 super_for_training.append(None)
+        lexicon = lexicon_rtl
     else:
         sentences_for_training = train_sentences
         tags_for_training = train_tags
         super_for_training = train_supertags
+        lexicon = lexicon_ltr
 
-    parser = Parser(label_names)
+    if system_type == "arc-eager":
+        parser = ArcEagerParser(label_names, lexicon=lexicon)
+    else:
+        parser = Parser(label_names, lexicon=lexicon)
+
     random_generator = random.Random(seed)
     for epoch in range(PARSER_EPOCHS):
         parser.train_one_epoch(
@@ -283,7 +354,6 @@ def _best_label_for_head(head_idx, word_idx, predictions, weights, sentence_idx,
                 first_seen[lab] = m
     if label_votes:
         return max(label_votes.keys(), key=lambda l: (label_votes[l], -first_seen[l]))
-    # Fallback: most common non-root label voted for this word across any head
     any_votes = {}
     for m, (_, all_labels) in enumerate(predictions):
         lab = all_labels[sentence_idx][word_idx]
@@ -294,52 +364,149 @@ def _best_label_for_head(head_idx, word_idx, predictions, weights, sentence_idx,
     return fallback_label
 
 
-def _enforce_valid_tree(heads, labels, head_votes_per_word, predictions, weights, sentence_idx):
+def _refine_ud_tree(words, heads, labels):
     """
-    Ensure the voted dependency graph is a valid single-root, cycle-free tree:
-      1. Exactly one word has head == 0 (with label 'root').
-      2. No non-root word has label 'root'.
-      3. Any directed cycles are broken by switching the weakest cycle arc to
+    Apply deterministic Universal Dependencies v2 structural consistency rules
+    to the voted parse tree:
+      1. Pure punctuation tokens (never at root) always take label `punct`.
+      2. Prepositional phrases (`case` child present) modifying a pure nominal
+         argument (`obj`, `iobj`, `nsubj`, `nsubj:pass`, `nmod`, `nmod:poss`,
+         `compound`, `appos` without copula/auxiliary/subject children) take
+         `nmod` rather than `obl`; possessive `'s` phrases preceding their head
+         take `nmod:poss`.
+      3. Multi-word proper names (`flat`): if token `i+1` attaches to `i-1` as
+         `flat` and intervening capitalized proper name `i` was attached to
+         `i+1` or `i-1` as `case`/`compound`/`dep`, attach `i` to `i-1` as `flat`.
+    """
+    n = len(words) - 1
+    if n <= 0:
+        return heads, labels
+
+    # 1. Punctuation label consistency
+    for i in range(1, n + 1):
+        if heads[i] != 0 and is_punct_word(words[i]):
+            labels[i] = "punct"
+
+    # 2. Multi-word proper noun (`flat`) continuity (e.g., "Mary Jo Foley")
+    for i in range(2, n):
+        if heads[i + 1] == i - 1 and labels[i + 1] == "flat":
+            w_i = words[i]
+            if w_i and w_i[0].isupper() and w_i.replace(".", "").isalpha():
+                if heads[i] in (i - 1, i + 1) and labels[i] in ("case", "compound", "dep", "nmod"):
+                    heads[i] = i - 1
+                    labels[i] = "flat"
+
+    # Build child lists for structural label checks
+    children = [[] for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        h = heads[i]
+        if 0 <= h <= n:
+            children[h].append(i)
+
+    # 3. Prepositional/possessive phrase (`case` child) `obl` vs `nmod` / `nmod:poss`
+    nominal_head_labels = {
+        "obj", "iobj", "nsubj", "nsubj:pass",
+        "nmod", "nmod:poss", "compound", "appos",
+    }
+    clausal_child_labels = {
+        "cop", "aux", "aux:pass", "nsubj", "nsubj:pass", "csubj", "expl",
+    }
+
+    for i in range(1, n + 1):
+        case_children = [c for c in children[i] if labels[c] == "case"]
+        if not case_children:
+            continue
+
+        # Check possessive clitic `'s`
+        has_poss_case = any(
+            normalize_word(words[c]) in ("'s", "'") for c in case_children
+        )
+        if has_poss_case and heads[i] > i and labels[i] in ("nmod", "compound", "obl", "dep"):
+            labels[i] = "nmod:poss"
+            continue
+
+        # Check PP attached as `obl` to a pure nominal head
+        h = heads[i]
+        if labels[i] == "obl" and 1 <= h <= n and labels[h] in nominal_head_labels:
+            head_is_predicate = any(labels[ch] in clausal_child_labels for ch in children[h])
+            if not head_is_predicate:
+                labels[i] = "nmod"
+
+    return heads, labels
+
+
+def _enforce_valid_tree(
+    words, heads, labels, head_votes_per_word, predictions, weights, sentence_idx
+):
+    """
+    Ensure the voted dependency graph is a valid single-root, cycle-free UD tree:
+      1. Pure punctuation tokens do not serve as heads of non-punctuation tokens.
+      2. Exactly one word has head == 0 (with label 'root').
+      3. No non-root word has label 'root'.
+      4. Any directed cycles are broken by switching the weakest cycle arc to
          its best outside head.
+      5. Post-hoc UD v2 structural label consistency refinement.
     """
     n = len(heads) - 1
     if n <= 0:
         return heads, labels
 
-    # 1. Enforce exactly one root (head == 0)
-    roots = [i for i in range(1, n + 1) if heads[i] == 0]
-    if len(roots) == 0:
-        best_r = max(range(1, n + 1), key=lambda i: head_votes_per_word[i].get(0, -1.0))
-        heads[best_r] = 0
-        labels[best_r] = "root"
-        roots = [best_r]
-    elif len(roots) > 1:
-        best_r = max(roots, key=lambda i: head_votes_per_word[i].get(0, 0.0))
-        for i in roots:
-            if i != best_r:
-                # Pick best non-zero head for i
-                non_zero = {h: v for h, v in head_votes_per_word[i].items() if h != 0 and h != i}
-                if non_zero:
-                    new_h = max(non_zero.keys(), key=lambda h: non_zero[h])
-                else:
-                    new_h = best_r
-                heads[i] = new_h
-                labels[i] = _best_label_for_head(new_h, i, predictions, weights, sentence_idx)
-        heads[best_r] = 0
-        labels[best_r] = "root"
-    else:
-        labels[roots[0]] = "root"
+    punct_flags = [False] * (n + 1)
+    for i in range(1, n + 1):
+        punct_flags[i] = is_punct_word(words[i])
 
-    root_idx = [i for i in range(1, n + 1) if heads[i] == 0][0]
+    # 1. Prevent non-punctuation words from attaching to punctuation heads
+    if not all(punct_flags[1:]):
+        for i in range(1, n + 1):
+            h = heads[i]
+            if not punct_flags[i] and h > 0 and punct_flags[h]:
+                valid_cands = {
+                    cand_h: v
+                    for cand_h, v in head_votes_per_word[i].items()
+                    if cand_h != i and (cand_h == 0 or not punct_flags[cand_h])
+                }
+                if valid_cands:
+                    new_h = max(valid_cands.keys(), key=lambda ch: valid_cands[ch])
+                    heads[i] = new_h
+                    labels[i] = _best_label_for_head(new_h, i, predictions, weights, sentence_idx)
+
+    # 2. Enforce exactly one root (head == 0), preferring non-punctuation tokens
+    roots = [i for i in range(1, n + 1) if heads[i] == 0]
+    non_punct_roots = [i for i in roots if not punct_flags[i]]
+    if non_punct_roots:
+        best_r = max(non_punct_roots, key=lambda i: head_votes_per_word[i].get(0, 0.0))
+    elif len(roots) > 0:
+        best_r = max(roots, key=lambda i: head_votes_per_word[i].get(0, 0.0))
+    else:
+        cands = [i for i in range(1, n + 1) if not punct_flags[i]] or list(range(1, n + 1))
+        best_r = max(cands, key=lambda i: head_votes_per_word[i].get(0, -1.0))
+
+    for i in roots:
+        if i != best_r:
+            non_zero = {
+                h: v
+                for h, v in head_votes_per_word[i].items()
+                if h != 0 and h != i and (punct_flags[i] or not punct_flags[h])
+            }
+            if non_zero:
+                new_h = max(non_zero.keys(), key=lambda h: non_zero[h])
+            else:
+                new_h = best_r
+            heads[i] = new_h
+            labels[i] = _best_label_for_head(new_h, i, predictions, weights, sentence_idx)
+
+    heads[best_r] = 0
+    labels[best_r] = "root"
+    root_idx = best_r
 
     # Ensure no non-root token has label == "root"
     for i in range(1, n + 1):
         if i != root_idx and labels[i] == "root":
             labels[i] = _best_label_for_head(heads[i], i, predictions, weights, sentence_idx)
 
-    # 2. Break any directed cycles
+    # 3. Break any directed cycles
     for _ in range(n + 1):
-        visited = [0] * (n + 1)  # 0 = unvisited, 1 = visiting, 2 = safe (reaches root)
+        visited = [0] * (n + 1)
         visited[0] = 2
         cycle_nodes = None
 
@@ -362,7 +529,6 @@ def _enforce_valid_tree(heads, labels, head_votes_per_word, predictions, weights
         if not cycle_nodes:
             break
 
-        # Find ancestors of every node outside the cycle so we don't create a new cycle
         best_change = None
         best_loss = 1e9
         for u in cycle_nodes:
@@ -370,7 +536,8 @@ def _enforce_valid_tree(heads, labels, head_votes_per_word, predictions, weights
             for cand_h, cand_score in head_votes_per_word[u].items():
                 if cand_h == 0 or cand_h == u or cand_h in cycle_nodes:
                     continue
-                # Check if cand_h reaches 0 without hitting cycle_nodes
+                if not punct_flags[u] and punct_flags[cand_h]:
+                    continue
                 anc = cand_h
                 ok = True
                 steps = 0
@@ -389,19 +556,18 @@ def _enforce_valid_tree(heads, labels, head_votes_per_word, predictions, weights
         if best_change is not None:
             u, new_h = best_change
         else:
-            # Attach the cycle node with weakest current arc directly to root_idx
             u = min(cycle_nodes, key=lambda node: head_votes_per_word[node].get(heads[node], 0.0))
             new_h = root_idx
         heads[u] = new_h
         labels[u] = _best_label_for_head(new_h, u, predictions, weights, sentence_idx)
 
-    return heads, labels
+    return _refine_ud_tree(words, heads, labels)
 
 
 def vote(predictions, sentences, weights=None):
     """
-    Combine the answers of several parsers using weighted voting and
-    global single-root cycle-free tree enforcement.
+    Combine the answers of several parsers using weighted voting,
+    global single-root cycle-free tree enforcement, and UD label refinement.
     """
     if weights is None:
         weights = [1.0] * len(predictions)
@@ -409,10 +575,11 @@ def vote(predictions, sentences, weights=None):
     voted_heads = []
     voted_labels = []
     for k in range(len(sentences)):
+        words = sentences[k]["words"]
         heads = [-1]
         labels = [""]
         head_votes_per_word = [{}]
-        n = len(sentences[k]["words"]) - 1
+        n = len(words) - 1
 
         for i in range(1, n + 1):
             head_votes = {}
@@ -431,7 +598,7 @@ def vote(predictions, sentences, weights=None):
             labels.append(best_label)
 
         heads, labels = _enforce_valid_tree(
-            heads, labels, head_votes_per_word, predictions, weights, k
+            words, heads, labels, head_votes_per_word, predictions, weights, k
         )
         voted_heads.append(heads)
         voted_labels.append(labels)
@@ -459,11 +626,22 @@ def check_mode(all_train):
     if USE_SECOND_PASS_TAGGER:
         print("    supertag accuracy on check data: %.2f" % tag_accuracy(make_supertag_targets(dev_sentences), dev_supertags))
 
+    tag_Target_ltr = make_tag_targets(train_sentences)
+    lexicon_ltr = build_lexicon(tag_Target_ltr)
+    flipped_tag_Target = [flip_sentence(s) for s in tag_Target_ltr]
+    for k in range(len(flipped_tag_Target)):
+        flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
+    lexicon_rtl = build_lexicon(flipped_tag_Target)
+
     predictions = []
     weights = []
-    for (direction, seed, weight) in PARSERS:
-        print("Training parser:", direction, "seed", seed, "(weight %.2f)" % weight)
+    for (system_type, direction, seed, weight) in PARSERS:
+        print(
+            "Training parser: %s (%s, seed %d, weight %.2f)"
+            % (system_type, direction, seed, weight)
+        )
         results = train_one_parser(
+            system_type,
             direction,
             seed,
             label_names,
@@ -473,6 +651,8 @@ def check_mode(all_train):
             [dev_sentences],
             [dev_tags],
             [dev_supertags],
+            lexicon_ltr=lexicon_ltr,
+            lexicon_rtl=lexicon_rtl,
         )
         predictions.append(results[0])
         weights.append(weight)
@@ -501,11 +681,22 @@ def final_mode(train_sentences):
     test_tags = other_tags[0]
     test_supertags = other_supertags[0]
 
+    tag_Target_ltr = make_tag_targets(train_sentences)
+    lexicon_ltr = build_lexicon(tag_Target_ltr)
+    flipped_tag_Target = [flip_sentence(s) for s in tag_Target_ltr]
+    for k in range(len(flipped_tag_Target)):
+        flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
+    lexicon_rtl = build_lexicon(flipped_tag_Target)
+
     test_predictions = []
     weights = []
-    for (direction, seed, weight) in PARSERS:
-        print("Training parser:", direction, "seed", seed, "(weight %.2f)" % weight)
+    for (system_type, direction, seed, weight) in PARSERS:
+        print(
+            "Training parser: %s (%s, seed %d, weight %.2f)"
+            % (system_type, direction, seed, weight)
+        )
         results = train_one_parser(
+            system_type,
             direction,
             seed,
             label_names,
@@ -515,6 +706,8 @@ def final_mode(train_sentences):
             [test_sentences],
             [test_tags],
             [test_supertags],
+            lexicon_ltr=lexicon_ltr,
+            lexicon_rtl=lexicon_rtl,
         )
         test_predictions.append(results[0])
         weights.append(weight)
