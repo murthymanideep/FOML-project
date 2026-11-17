@@ -25,6 +25,7 @@ from data_utils import (
     tag_direction,
     head_offset_bucket,
     is_punct_word,
+    find_punct_forms,
     build_lexicon,
     lookup_word_priors,
     PRONOUN_WORDS,
@@ -64,6 +65,11 @@ def make_upos_targets(sentences):
     for nw, cmap in nonclause_counts.items():
         nonclause_dom[nw] = max(cmap.items(), key=lambda kv: kv[1])[0]
 
+    # Word forms that are (almost) always punctuation in this data. Symbols
+    # like "$", "&", "%", ":)" are not in this set: they get the class that
+    # their label gives them (for example "&" is "cc", so CCONJ).
+    punct_forms = find_punct_forms(sentences)
+
     upos_sentences = []
     for s in sentences:
         words = s["words"]
@@ -98,7 +104,7 @@ def make_upos_targets(sentences):
                 for c in c_list
             )
 
-            if b_lab == "punct" or is_punct_word(w):
+            if b_lab == "punct" or w in punct_forms:
                 u = "PUNCT"
             elif b_lab == "det":
                 u = "DET"

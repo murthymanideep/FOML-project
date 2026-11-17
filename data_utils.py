@@ -16,6 +16,8 @@ has token_id i, and a head of 0 means "the root", exactly like in the data.
 """
 
 import csv
+import os
+import sys
 
 
 ROOT_WORD = "<ROOT>"
@@ -106,6 +108,46 @@ def is_punct_word(word):
     if word == "" or word in PUNCT_TOKENS:
         return True
     return not any(c.isalnum() for c in word)
+
+
+def find_punct_forms(sentences, min_share=0.98, min_count=3):
+    """
+    Return the set of word forms that the training data labels "punct"
+    almost always (in at least `min_share` of the cases, and seen at least
+    `min_count` times).
+
+    We cannot decide this from the characters alone: in this data "&" is
+    "cc", "$" heads the number after it, "%" is a noun and ":)" is
+    "discourse". Only these forms may be forced to "punct" or blocked from
+    being a head.
+    """
+    total = {}
+    punct = {}
+    for sentence in sentences:
+        for i in range(1, len(sentence["words"])):
+            word = sentence["words"][i]
+            total[word] = total.get(word, 0) + 1
+            if sentence["labels"][i] == "punct":
+                punct[word] = punct.get(word, 0) + 1
+
+    forms = set()
+    for word in total:
+        if total[word] >= min_count and punct.get(word, 0) >= min_share * total[word]:
+            forms.add(word)
+    return forms
+
+
+def make_hashing_repeatable():
+    """
+    The perceptrons use Python's hash() to find the table row of a feature.
+    Python gives different hash numbers in every run unless the setting
+    PYTHONHASHSEED is fixed, so two runs of the same code gave slightly
+    different models. If the setting is not 0, start this same script again
+    with PYTHONHASHSEED=0. Call this before anything else.
+    """
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        os.environ["PYTHONHASHSEED"] = "0"
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def make_empty_sentence(name):

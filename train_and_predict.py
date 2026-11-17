@@ -15,11 +15,17 @@ Extra options (can be combined with --check):
     --one-parser       train only the first parser (fast, for experiments)
     --no-second-pass   do not use the second-pass tagger, supertagger & MST guide
     --no-copy          do not copy answers of sentences seen in training
+
+At the end, both modes save the outputs of all trained parsers in
+outputs/check_cache.pkl or outputs/final_cache.pkl. Then revote.py can redo
+only the last step (vote + rule-based fixes) in a few minutes, without
+training anything again.
 """
 
 import gc
 import math
 import os
+import pickle
 import random
 import sys
 import time
@@ -30,7 +36,8 @@ from data_utils import (
     write_submission,
     accuracy,
     normalize_word,
-    is_punct_word,
+    find_punct_forms,
+    make_hashing_repeatable,
     build_lexicon,
 )
 from tagger import (
@@ -92,6 +99,29 @@ PARSERS = [
 
 USE_SECOND_PASS_TAGGER = True
 COPY_KNOWN_SENTENCES = True
+
+# Check split (--check): the training sentences are cut into groups of this
+# many neighbouring sentences, and every 10th group is the check data.
+# Neighbouring sentences mostly come from the same document, so the check
+# data has documents the models never saw, like the real test data.
+# (Taking every 10th single sentence made the check far too easy.)
+CHECK_GROUP_SIZE = 100
+
+# Rule-based fixes applied after the vote. Each one can be switched off.
+#   punct    : true punctuation always gets the label "punct"
+#   flat     : continue multi-word names ("flat")
+#   passive  : "nsubj" -> "nsubj:pass" when the verb has "aux:pass"
+#   obl_nmod : swap "obl" / "nmod" depending on the kind of head
+# --check prints the score with each rule on and off.
+RULES = {
+    "punct": True,
+    "flat": True,
+    "passive": True,
+    "obl_nmod": True,
+}
+
+CHECK_CACHE = os.path.join(OUTPUT_FOLDER, "check_cache.pkl")
+FINAL_CACHE = os.path.join(OUTPUT_FOLDER, "final_cache.pkl")
 
 # --------------------------------------------------------------------
 
@@ -521,28 +551,37 @@ def train_one_parser(
     return results
 
 
-def _refine_ud_tree(words, heads, labels, upos=None):
+def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=None):
     """
-    Apply deterministic Universal Dependencies v2 structural consistency rules
-    to the globally decoded parse tree.
+    Apply simple Universal Dependencies rules to one voted tree.
+
+    rules       : which rules are on (see RULES at the top of this file)
+    punct_forms : word forms that are almost always "punct" in the training
+                  data (from find_punct_forms)
     """
+    if rules is None:
+        rules = RULES
     n = len(words) - 1
     if n <= 0:
         return heads, labels
 
-    # 1. Punctuation label consistency
-    for i in range(1, n + 1):
-        if heads[i] != 0 and is_punct_word(words[i]):
-            labels[i] = "punct"
+    # 1. True punctuation always gets the label "punct".
+    #    Only forms that are "punct" in at least 98% of the training cases:
+    #    symbols like "&", "$", "%", ":)" are NOT punctuation in this data.
+    if rules["punct"] and punct_forms is not None:
+        for i in range(1, n + 1):
+            if heads[i] != 0 and words[i] in punct_forms:
+                labels[i] = "punct"
 
     # 2. Multi-word proper noun (`flat`) continuity
-    for i in range(2, n):
-        if heads[i + 1] == i - 1 and labels[i + 1] == "flat":
-            w_i = words[i]
-            if w_i and w_i[0].isupper() and w_i.replace(".", "").isalpha():
-                if heads[i] in (i - 1, i + 1) and labels[i] in ("case", "compound", "dep", "nmod"):
-                    heads[i] = i - 1
-                    labels[i] = "flat"
+    if rules["flat"]:
+        for i in range(2, n):
+            if heads[i + 1] == i - 1 and labels[i + 1] == "flat":
+                w_i = words[i]
+                if w_i and w_i[0].isupper() and w_i.replace(".", "").isalpha():
+                    if heads[i] in (i - 1, i + 1) and labels[i] in ("case", "compound", "dep", "nmod"):
+                        heads[i] = i - 1
+                        labels[i] = "flat"
 
     children = [[] for _ in range(n + 1)]
     for i in range(1, n + 1):
@@ -551,19 +590,25 @@ def _refine_ud_tree(words, heads, labels, upos=None):
             children[h].append(i)
 
     # 3. Passive subject consistency (`aux:pass` child on predicate -> `nsubj:pass`)
-    for h in range(1, n + 1):
-        has_aux_pass = any(labels[ch] == "aux:pass" for ch in children[h])
-        has_cop_or_obj = any(labels[ch] in ("cop", "obj") for ch in children[h])
-        if has_aux_pass and not has_cop_or_obj:
-            for ch in children[h]:
-                if ch < h and labels[ch] == "nsubj":
-                    labels[ch] = "nsubj:pass"
+    if rules["passive"]:
+        for h in range(1, n + 1):
+            has_aux_pass = any(labels[ch] == "aux:pass" for ch in children[h])
+            has_cop_or_obj = any(labels[ch] in ("cop", "obj") for ch in children[h])
+            if has_aux_pass and not has_cop_or_obj:
+                for ch in children[h]:
+                    if ch < h and labels[ch] == "nsubj":
+                        labels[ch] = "nsubj:pass"
+
+    if not rules["obl_nmod"]:
+        return heads, labels
 
     # 4. Prepositional/possessive phrase (`case` child) `obl` <-> `nmod` / `nmod:poss`
+    #    (This data uses the label names "nmod:unmarked", "obl:unmarked" and
+    #    "nmod:desc"; the old names "nmod:tmod", "obl:npmod", ... never occur.)
     nominal_head_labels = {
         "obj", "iobj", "nsubj", "nsubj:pass",
-        "nmod", "nmod:poss", "nmod:tmod", "nmod:npmod",
-        "obl", "obl:tmod", "obl:npmod",
+        "nmod", "nmod:poss", "nmod:unmarked", "nmod:desc",
+        "obl", "obl:unmarked",
         "compound", "appos", "vocative", "flat",
     }
     clausal_child_labels = {
@@ -610,6 +655,22 @@ def _refine_ud_tree(words, heads, labels, upos=None):
     return heads, labels
 
 
+def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules=None):
+    """Return copies of all trees with the rule-based fixes applied."""
+    new_heads = []
+    new_labels = []
+    for k in range(len(sentences)):
+        heads = list(all_heads[k])
+        labels = list(all_labels[k])
+        upos = None
+        if upos_list is not None:
+            upos = upos_list[k]
+        heads, labels = _refine_ud_tree(sentences[k]["words"], heads, labels, upos, punct_forms, rules)
+        new_heads.append(heads)
+        new_labels.append(labels)
+    return new_heads, new_labels
+
+
 def vote(
     predictions,
     sentences,
@@ -619,15 +680,19 @@ def vote(
     mst_list=None,
     upos_list=None,
     tree_labeler=None,
+    punct_forms=None,
 ):
     """
     Combine all parsers via:
       1. Margin-confidence-weighted arc score matrix construction (combining all
          12 transition parsers across 3 transition systems + 2-seed Global Graph-MST).
-      2. Exact single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding.
+      2. Single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding.
       3. Full-tree 2nd/3rd-order label scoring (`FullTreeLabeler`) blended with
          the transition ensemble's confidence-weighted label votes.
-      4. Universal Dependencies v2 structural consistency refinement.
+    The rule-based fixes are NOT applied here; call apply_rules afterwards.
+
+    punct_forms: word forms that are almost always "punct" in the training
+    data. Only these are blocked from being the head of a normal word.
     """
     if weights is None:
         weights = [1.0] * len(predictions)
@@ -643,7 +708,9 @@ def vote(
             voted_labels.append([""])
             continue
 
-        punct_flags = [False] + [is_punct_word(words[i]) for i in range(1, n + 1)]
+        punct_flags = [False]
+        for i in range(1, n + 1):
+            punct_flags.append(punct_forms is not None and words[i] in punct_forms)
         all_punct = all(punct_flags[1:])
 
         # Build (n + 1) x (n + 1) global arc score matrix
@@ -750,11 +817,62 @@ def vote(
                 best_lab = "dep"
             labels[i] = best_lab
 
-        heads, labels = _refine_ud_tree(words, heads, labels, upos=utags)
         voted_heads.append(heads)
         voted_labels.append(labels)
 
     return voted_heads, voted_labels
+
+
+RULE_VARIANTS = [
+    ("no rules", {"punct": False, "flat": False, "passive": False, "obl_nmod": False}),
+    ("punct only", {"punct": True, "flat": False, "passive": False, "obl_nmod": False}),
+    ("punct + flat", {"punct": True, "flat": True, "passive": False, "obl_nmod": False}),
+    ("punct + passive", {"punct": True, "flat": False, "passive": True, "obl_nmod": False}),
+    ("punct + obl_nmod", {"punct": True, "flat": False, "passive": False, "obl_nmod": True}),
+    ("all rules", {"punct": True, "flat": True, "passive": True, "obl_nmod": True}),
+]
+
+
+def print_rule_table(train_sentences, sentences, voted_heads, voted_labels, upos_list, punct_forms):
+    """Print the check score with each set of rule-based fixes (cheap: no new vote)."""
+    print("Rule-based fixes on the voted trees (choose the best in RULES at the top of the file):")
+    for (name, rules) in RULE_VARIANTS:
+        heads, labels = apply_rules(sentences, voted_heads, voted_labels, upos_list, punct_forms, rules)
+        if COPY_KNOWN_SENTENCES:
+            copy_known_sentences(train_sentences, sentences, heads, labels)
+        uas, las = accuracy(sentences, heads, labels)
+        print("    %-18s UAS %.2f  LAS %.2f" % (name, uas, las))
+
+
+def save_cache(path, cache):
+    """Save the outputs of all trained models, for revote.py."""
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    with open(path, "wb") as cache_file:
+        pickle.dump(cache, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
+    print("Saved the parser outputs in", path, "(revote.py can use them)")
+
+
+def write_final_submission(test_sentences, test_heads, test_labels, train_sentences):
+    """Write outputs/submission.csv in the format of data/sample.csv."""
+    # Collect "HEAD|LABEL" for every row ID.
+    answer_of_id = {}
+    for k in range(len(test_sentences)):
+        for i in range(1, len(test_sentences[k]["words"])):
+            row_id = test_sentences[k]["row_ids"][i - 1]
+            answer_of_id[row_id] = str(test_heads[k][i]) + "|" + test_labels[k][i]
+
+    # The sample file also lists the training rows. Kaggle only scores the
+    # test rows, so we simply fill the training rows with their answers.
+    for k in range(len(train_sentences)):
+        for i in range(1, len(train_sentences[k]["words"])):
+            row_id = train_sentences[k]["row_ids"][i - 1]
+            answer_of_id[row_id] = str(train_sentences[k]["heads"][i]) + "|" + train_sentences[k]["labels"][i]
+
+    sample_ids, header = read_sample_ids(os.path.join(DATA_FOLDER, "sample.csv"))
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    output_path = os.path.join(OUTPUT_FOLDER, "submission.csv")
+    write_submission(output_path, header, sample_ids, answer_of_id)
+    print("Wrote", len(sample_ids), "rows to", output_path)
 
 
 def check_mode(all_train):
@@ -762,13 +880,16 @@ def check_mode(all_train):
     train_sentences = []
     dev_sentences = []
     for k in range(len(all_train)):
-        if k % 10 == 0:
+        group = k // CHECK_GROUP_SIZE
+        if group % 10 == 0:
             dev_sentences.append(all_train[k])
         else:
             train_sentences.append(all_train[k])
     print("Training sentences:", len(train_sentences), " check sentences:", len(dev_sentences))
+    print("(check data = every 10th group of %d neighbouring sentences)" % CHECK_GROUP_SIZE)
 
     label_names = get_label_names(all_train)
+    punct_forms = find_punct_forms(train_sentences)
     (
         train_tags,
         other_tags,
@@ -863,14 +984,35 @@ def check_mode(all_train):
             mst_list=dev_mst,
             upos_list=dev_upos,
             tree_labeler=tree_labeler,
+            punct_forms=punct_forms,
         )
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
-        print("    Chu-Liu/Edmonds ensemble (%d parsers + MST): UAS %.2f  LAS %.2f   <- LAS is the competition score" % (len(predictions), uas, las))
+        print("    Chu-Liu/Edmonds ensemble (%d parsers + MST, before rules): UAS %.2f  LAS %.2f" % (len(predictions), uas, las))
 
+    print_rule_table(train_sentences, dev_sentences, voted_heads, voted_labels, dev_upos, punct_forms)
+
+    final_heads, final_labels = apply_rules(dev_sentences, voted_heads, voted_labels, dev_upos, punct_forms, RULES)
     if COPY_KNOWN_SENTENCES:
-        copied = copy_known_sentences(train_sentences, dev_sentences, voted_heads, voted_labels)
-        uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
-        print("After copying %d known sentences: UAS %.2f  LAS %.2f" % (copied, uas, las))
+        copied = copy_known_sentences(train_sentences, dev_sentences, final_heads, final_labels)
+        print("Copied the training answer for %d check sentences" % copied)
+    uas, las = accuracy(dev_sentences, final_heads, final_labels)
+    print("FINAL check score with the current settings: UAS %.2f  LAS %.2f   <- LAS is the competition score" % (uas, las))
+
+    cache = {
+        "mode": "check",
+        "train_sentences": train_sentences,
+        "sentences": dev_sentences,
+        "predictions": predictions,
+        "weights": weights,
+        "parsers": list(PARSERS),
+        "tags": dev_tags,
+        "supertags": dev_supertags,
+        "upos": dev_upos,
+        "mst": dev_mst,
+        "tree_labeler": tree_labeler,
+        "punct_forms": punct_forms,
+    }
+    save_cache(CHECK_CACHE, cache)
 
 
 def final_mode(train_sentences):
@@ -879,6 +1021,7 @@ def final_mode(train_sentences):
     print("Training sentences:", len(train_sentences), " test sentences:", len(test_sentences))
 
     label_names = get_label_names(train_sentences)
+    punct_forms = find_punct_forms(train_sentences)
     (
         train_tags,
         other_tags,
@@ -954,7 +1097,7 @@ def final_mode(train_sentences):
         weights.append(weight)
         gc.collect()
 
-    test_heads, test_labels = vote(
+    voted_heads, voted_labels = vote(
         test_predictions,
         test_sentences,
         weights,
@@ -963,32 +1106,37 @@ def final_mode(train_sentences):
         mst_list=test_mst,
         upos_list=test_upos,
         tree_labeler=tree_labeler,
+        punct_forms=punct_forms,
     )
+    test_heads, test_labels = apply_rules(test_sentences, voted_heads, voted_labels, test_upos, punct_forms, RULES)
     if COPY_KNOWN_SENTENCES:
         copied = copy_known_sentences(train_sentences, test_sentences, test_heads, test_labels)
         print("Copied the training answer for", copied, "test sentences")
 
-    # Collect "HEAD|LABEL" for every row ID.
-    answer_of_id = {}
-    for k in range(len(test_sentences)):
-        for i in range(1, len(test_sentences[k]["words"])):
-            row_id = test_sentences[k]["row_ids"][i - 1]
-            answer_of_id[row_id] = str(test_heads[k][i]) + "|" + test_labels[k][i]
+    write_final_submission(test_sentences, test_heads, test_labels, train_sentences)
 
-    for k in range(len(train_sentences)):
-        for i in range(1, len(train_sentences[k]["words"])):
-            row_id = train_sentences[k]["row_ids"][i - 1]
-            answer_of_id[row_id] = str(train_sentences[k]["heads"][i]) + "|" + train_sentences[k]["labels"][i]
-
-    sample_ids, header = read_sample_ids(os.path.join(DATA_FOLDER, "sample.csv"))
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    output_path = os.path.join(OUTPUT_FOLDER, "submission.csv")
-    write_submission(output_path, header, sample_ids, answer_of_id)
-    print("Wrote", len(sample_ids), "rows to", output_path)
+    cache = {
+        "mode": "final",
+        "train_sentences": train_sentences,
+        "sentences": test_sentences,
+        "predictions": test_predictions,
+        "weights": weights,
+        "parsers": list(PARSERS),
+        "tags": test_tags,
+        "supertags": test_supertags,
+        "upos": test_upos,
+        "mst": test_mst,
+        "tree_labeler": tree_labeler,
+        "punct_forms": punct_forms,
+    }
+    save_cache(FINAL_CACHE, cache)
 
 
 def main():
     global PARSERS, USE_SECOND_PASS_TAGGER, COPY_KNOWN_SENTENCES
+    # Must come first: restarts the script with repeatable hashing if needed.
+    make_hashing_repeatable()
+
     if "--one-parser" in sys.argv:
         PARSERS = PARSERS[:1]
     if "--no-second-pass" in sys.argv:
