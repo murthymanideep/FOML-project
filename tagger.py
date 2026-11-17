@@ -26,10 +26,10 @@ from data_utils import (
     head_offset_bucket,
     is_punct_word,
     find_punct_forms,
+    find_standalone_nominals,
+    find_possessive_markers,
     build_lexicon,
     lookup_word_priors,
-    PRONOUN_WORDS,
-    POSSESSIVE_PRONOUNS,
 )
 from perceptron import AveragedPerceptron
 
@@ -40,10 +40,14 @@ END = "<END>"
 
 def make_upos_targets(sentences):
     """
-    Induce each token's intrinsic Universal Part-of-Speech / Syntactic Category
-    (`upos`, 19 classes) strictly from the gold dependency structures in `sentences`.
-    Distinguishes true finite/non-finite verbs (`VERB`, `VERB_VBG`, `VERB_VBN`,
-    `VERB_INF`) from copular predicate adjectives (`ADJ`) and predicate nouns (`NOUN`).
+    Make a word class for every training word (`upos`, 17 classes such as
+    NOUN, VERB, ADP, PUNCT), only from the training trees: from the word's
+    label, its children and how the word is used elsewhere in the data.
+    No hand-made lists of English words are used: the groups below
+    (punctuation, pronoun-like words, possessive markers) are learned from
+    the same sentences.
+    Verbs are split into VERB, VERB_VBN (has a passive child) and VERB_INF
+    (an xcomp); predicates with "cop" are ADJ or NOUN.
     """
     # Pass 1: collect non-clausal dominant base labels per normalized word
     nonclause_counts = {}
@@ -69,6 +73,9 @@ def make_upos_targets(sentences):
     # like "$", "&", "%", ":)" are not in this set: they get the class that
     # their label gives them (for example "&" is "cc", so CCONJ).
     punct_forms = find_punct_forms(sentences)
+    # Learned pronoun-like words ("he", "it", "my", ...) and possessive markers.
+    standalone_nominals = find_standalone_nominals(sentences)
+    possessive_markers = find_possessive_markers(sentences)
 
     upos_sentences = []
     for s in sentences:
@@ -99,10 +106,7 @@ def make_upos_targets(sentences):
             has_amod = any(base_label(labels[c]) == "amod" for c in c_list)
             has_obj = any(base_label(labels[c]) in ("obj", "iobj") for c in c_list)
             has_flat = any(base_label(labels[c]) == "flat" for c in c_list)
-            has_to_mark = any(
-                base_label(labels[c]) == "mark" and normalize_word(words[c]) == "to"
-                for c in c_list
-            )
+            is_capitalised = sig.startswith(("MID_CAP", "ALL_CAP"))
 
             if b_lab == "punct" or w in punct_forms:
                 u = "PUNCT"
@@ -121,19 +125,19 @@ def make_upos_targets(sentences):
             elif b_lab == "expl":
                 u = "PRON"
             elif b_lab == "case":
-                u = "PART" if nw in ("'s", "'") else "ADP"
+                u = "PART" if nw in possessive_markers else "ADP"
             elif b_lab == "mark":
-                u = "PART" if nw == "to" else "SCONJ"
+                u = "SCONJ"
             elif b_lab == "advmod":
-                u = "PART" if nw in ("not", "n't", "nt") else "ADV"
-            elif b_lab == "amod" or nw == "<ORDINAL>":
+                u = "ADV"
+            elif b_lab == "amod":
                 u = "ADJ"
             elif b_lab == "flat":
                 u = "PROPN"
             elif b_lab not in clausal_roles and not has_aux and not has_obj:
-                if nw in PRONOUN_WORDS or (lab == "nmod:poss" and nw in POSSESSIVE_PRONOUNS):
+                if nw in standalone_nominals:
                     u = "PRON"
-                elif has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
+                elif has_flat or is_capitalised:
                     u = "PROPN"
                 elif nonclause_dom.get(nw) == "amod" and not has_det:
                     u = "ADJ"
@@ -144,29 +148,27 @@ def make_upos_targets(sentences):
                 nc_dom = nonclause_dom.get(nw)
                 if has_cop:
                     if has_det or has_amod or nc_dom in ("nsubj", "obj", "obl", "nmod", "compound"):
-                        if has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
-                            u = "PROPN"
-                        elif nw in PRONOUN_WORDS:
+                        if nw in standalone_nominals:
                             u = "PRON"
+                        elif has_flat or is_capitalised:
+                            u = "PROPN"
                         else:
                             u = "NOUN"
                     else:
                         u = "ADJ"
                 elif not has_aux and not has_obj and (has_det or has_amod or has_flat):
-                    u = "PROPN" if (has_flat or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN"))) else "NOUN"
+                    u = "PROPN" if (has_flat or is_capitalised) else "NOUN"
                 elif not has_aux and not has_obj and b_lab == "conj":
-                    if nc_dom == "amod" or sig.endswith(("ADJ_ABLE", "ADJ_OUS", "ADJ_AL", "ADJ_IVE", "ADJ_IC", "ADJ_FUL", "ADJ_LESS")):
+                    if nc_dom == "amod":
                         u = "ADJ"
-                    elif nc_dom in ("nsubj", "obj", "obl", "nmod", "compound") or sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")):
-                        u = "PROPN" if sig.startswith(("MID_PROPN", "ALL_CAP_PROPN")) else "NOUN"
+                    elif nc_dom in ("nsubj", "obj", "obl", "nmod", "compound") or is_capitalised:
+                        u = "PROPN" if is_capitalised else "NOUN"
                     else:
                         u = "VERB"
                 else:
-                    if has_pass or (has_aux and sig.endswith(("VERB_ED", "VERB_EN"))):
+                    if has_pass:
                         u = "VERB_VBN"
-                    elif nw.endswith("ing") and len(nw) > 4:
-                        u = "VERB_VBG"
-                    elif has_to_mark or b_lab == "xcomp":
+                    elif b_lab == "xcomp":
                         u = "VERB_INF"
                     else:
                         u = "VERB"
@@ -327,7 +329,7 @@ def _prepare_upos_sentence_context(upos_tags):
         left_v[i] = lv
         left_n[i] = ln
         u = upos_tags[i]
-        if u in ("VERB", "COP", "VERB_VBN", "VERB_VBG", "VERB_INF"):
+        if u in ("VERB", "COP", "VERB_VBN", "VERB_INF"):
             lv = i
         if u in ("NOUN", "PROPN", "PRON"):
             ln = i
@@ -338,7 +340,7 @@ def _prepare_upos_sentence_context(upos_tags):
         right_v[i] = rv
         right_n[i] = rn
         u = upos_tags[i]
-        if u in ("VERB", "COP", "VERB_VBN", "VERB_VBG", "VERB_INF"):
+        if u in ("VERB", "COP", "VERB_VBN", "VERB_INF"):
             rv = i
         if u in ("NOUN", "PROPN", "PRON"):
             rn = i

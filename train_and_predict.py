@@ -16,16 +16,18 @@ Extra options (can be combined with --check):
     --no-second-pass   do not use the second-pass tagger, supertagger & MST guide
     --no-copy          do not copy answers of sentences seen in training
 
-At the end, both modes save the outputs of all trained parsers in
-outputs/check_cache.pkl or outputs/final_cache.pkl. Then revote.py can redo
-only the last step (vote + rule-based fixes) in a few minutes, without
-training anything again.
+Run --check FIRST. At its end it learns, from the check data:
+  * the learned combiner (logistic regression, see combiner.py), and
+  * the best set of rule-based fixes,
+prints an error report, and saves these choices in best_settings.json.
+The normal run then uses them automatically (the combiner only if it beat
+the normal vote on the check data).
 """
 
 import gc
 import math
 import os
-import pickle
+import json
 import random
 import sys
 import time
@@ -37,6 +39,7 @@ from data_utils import (
     accuracy,
     normalize_word,
     find_punct_forms,
+    find_possessive_markers,
     make_hashing_repeatable,
     build_lexicon,
 )
@@ -65,6 +68,8 @@ from parser import (
 )
 
 import numpy as np
+
+import combiner
 
 
 # ----------------------------- settings -----------------------------
@@ -120,8 +125,15 @@ RULES = {
     "obl_nmod": True,
 }
 
-CHECK_CACHE = os.path.join(OUTPUT_FOLDER, "check_cache.pkl")
-FINAL_CACHE = os.path.join(OUTPUT_FOLDER, "final_cache.pkl")
+# The choices learned by --check (learned combiner + best rules). The normal
+# run uses them if this file exists. It is a small text file in the project
+# folder (not in outputs/), so it can be committed with the code: whoever
+# runs "python train_and_predict.py" later gets exactly the same choices.
+BEST_SETTINGS = "best_settings.json"
+
+# The learned combiner is only used if it beat the normal vote on the check
+# data by at least this much (in LAS points).
+COMBINER_MIN_GAIN = 0.10
 
 # --------------------------------------------------------------------
 
@@ -551,13 +563,15 @@ def train_one_parser(
     return results
 
 
-def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=None):
+def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=None, possessive_markers=None):
     """
     Apply simple Universal Dependencies rules to one voted tree.
 
     rules       : which rules are on (see RULES at the top of this file)
     punct_forms : word forms that are almost always "punct" in the training
                   data (from find_punct_forms)
+    possessive_markers : the possessive "case" words learned from the
+                  training data (from find_possessive_markers)
     """
     if rules is None:
         rules = RULES
@@ -623,9 +637,11 @@ def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=Non
         if not case_children:
             continue
 
-        has_poss_case = any(
-            normalize_word(words[c]) in ("'s", "'") for c in case_children
-        )
+        has_poss_case = False
+        if possessive_markers is not None:
+            for c in case_children:
+                if normalize_word(words[c]) in possessive_markers:
+                    has_poss_case = True
         if has_poss_case and heads[i] > i and labels[i] in ("nmod", "compound", "obl", "dep"):
             labels[i] = "nmod:poss"
             continue
@@ -655,7 +671,7 @@ def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=Non
     return heads, labels
 
 
-def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules=None):
+def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules=None, possessive_markers=None):
     """Return copies of all trees with the rule-based fixes applied."""
     new_heads = []
     new_labels = []
@@ -665,7 +681,7 @@ def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules=
         upos = None
         if upos_list is not None:
             upos = upos_list[k]
-        heads, labels = _refine_ud_tree(sentences[k]["words"], heads, labels, upos, punct_forms, rules)
+        heads, labels = _refine_ud_tree(sentences[k]["words"], heads, labels, upos, punct_forms, rules, possessive_markers)
         new_heads.append(heads)
         new_labels.append(labels)
     return new_heads, new_labels
@@ -833,23 +849,203 @@ RULE_VARIANTS = [
 ]
 
 
-def print_rule_table(train_sentences, sentences, voted_heads, voted_labels, upos_list, punct_forms):
-    """Print the check score with each set of rule-based fixes (cheap: no new vote)."""
-    print("Rule-based fixes on the voted trees (choose the best in RULES at the top of the file):")
+def make_outputs(train_sentences, sentences, predictions, weights, tags, supertags, upos, mst, tree_labeler, punct_forms):
+    """Put everything the last step needs in one dictionary (plus word groups learned from the training data)."""
+    outputs = {}
+    outputs["train_sentences"] = train_sentences
+    outputs["sentences"] = sentences
+    outputs["predictions"] = predictions
+    outputs["weights"] = weights
+    outputs["parsers"] = list(PARSERS)
+    outputs["tags"] = tags
+    outputs["supertags"] = supertags
+    outputs["upos"] = upos
+    outputs["mst"] = mst
+    outputs["tree_labeler"] = tree_labeler
+    outputs["punct_forms"] = punct_forms
+    outputs["possessive_markers"] = find_possessive_markers(train_sentences)
+    return outputs
+
+
+def normal_vote(outputs):
+    """The vote with hand-set weights (no rules yet)."""
+    return vote(
+        outputs["predictions"],
+        outputs["sentences"],
+        outputs["weights"],
+        tags_list=outputs["tags"],
+        supertags_list=outputs["supertags"],
+        mst_list=outputs["mst"],
+        upos_list=outputs["upos"],
+        tree_labeler=outputs["tree_labeler"],
+        punct_forms=outputs["punct_forms"],
+    )
+
+
+def finish_trees(outputs, heads, labels, rules):
+    """Rule-based fixes, then copying the answers of known sentences."""
+    sentences = outputs["sentences"]
+    heads, labels = apply_rules(sentences, heads, labels, outputs["upos"], outputs["punct_forms"], rules,
+                                outputs["possessive_markers"])
+    if COPY_KNOWN_SENTENCES:
+        copy_known_sentences(outputs["train_sentences"], sentences, heads, labels)
+    return heads, labels
+
+
+def choose_best_rules(outputs, voted_heads, voted_labels):
+    """Print the check score with each set of rule-based fixes; return the best set."""
+    print("Rule-based fixes on the voted trees:")
+    best_rules = None
+    best_las = -1.0
+    best_name = ""
     for (name, rules) in RULE_VARIANTS:
-        heads, labels = apply_rules(sentences, voted_heads, voted_labels, upos_list, punct_forms, rules)
-        if COPY_KNOWN_SENTENCES:
-            copy_known_sentences(train_sentences, sentences, heads, labels)
-        uas, las = accuracy(sentences, heads, labels)
+        heads, labels = finish_trees(outputs, voted_heads, voted_labels, rules)
+        uas, las = accuracy(outputs["sentences"], heads, labels)
         print("    %-18s UAS %.2f  LAS %.2f" % (name, uas, las))
+        if las > best_las:
+            best_las = las
+            best_rules = rules
+            best_name = name
+    print("    -> best: %s" % best_name)
+    return best_rules
 
 
-def save_cache(path, cache):
-    """Save the outputs of all trained models, for revote.py."""
-    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    with open(path, "wb") as cache_file:
-        pickle.dump(cache, cache_file, protocol=pickle.HIGHEST_PROTOCOL)
-    print("Saved the parser outputs in", path, "(revote.py can use them)")
+def most_common(counts, how_many):
+    """The keys with the biggest counts, biggest first."""
+    pairs = []
+    for key in counts:
+        pairs.append((counts[key], key))
+    pairs.sort(reverse=True)
+    return pairs[:how_many]
+
+
+def print_error_report(sentences, heads, labels):
+    """Where are the remaining mistakes?"""
+    total = 0
+    wrong_head = 0
+    wrong_label = 0
+    total_of = {}
+    wrong_of = {}
+    mix_ups = {}
+    for k in range(len(sentences)):
+        for i in range(1, len(sentences[k]["words"])):
+            gold_head = sentences[k]["heads"][i]
+            gold_label = sentences[k]["labels"][i]
+            total = total + 1
+            total_of[gold_label] = total_of.get(gold_label, 0) + 1
+            if heads[k][i] != gold_head:
+                wrong_head = wrong_head + 1
+                wrong_of[gold_label] = wrong_of.get(gold_label, 0) + 1
+            elif labels[k][i] != gold_label:
+                wrong_label = wrong_label + 1
+                wrong_of[gold_label] = wrong_of.get(gold_label, 0) + 1
+                mix_up = gold_label + " -> " + labels[k][i]
+                mix_ups[mix_up] = mix_ups.get(mix_up, 0) + 1
+
+    print("Error report (%d words):" % total)
+    print("    wrong head:                 %5d  (%.2f%% of all words)" % (wrong_head, 100.0 * wrong_head / total))
+    print("    right head but wrong label: %5d  (%.2f%% of all words)" % (wrong_label, 100.0 * wrong_label / total))
+    print("  Correct labels with the most errors (errors / count, points lost):")
+    for (count, label) in most_common(wrong_of, 15):
+        print("    %-15s %5d / %5d   -%.2f" % (label, count, total_of[label], 100.0 * count / total))
+    print("  Most common label mix-ups when the head is right (correct -> predicted):")
+    for (count, mix_up) in most_common(mix_ups, 12):
+        print("    %-32s %5d" % (mix_up, count))
+
+
+def learn_best_settings(outputs):
+    """
+    End of --check: choose the best rules, test the learned combiner fairly
+    (2-fold cross-validation), print an error report, and save the choices
+    in BEST_SETTINGS for the normal run.
+    """
+    sentences = outputs["sentences"]
+    voted_heads, voted_labels = normal_vote(outputs)
+    best_rules = choose_best_rules(outputs, voted_heads, voted_labels)
+
+    print("Learned combiner (logistic regression, 2-fold cross-validation on the check data):")
+    hand_heads, hand_labels = finish_trees(outputs, voted_heads, voted_labels, best_rules)
+    uas, hand_las = accuracy(sentences, hand_heads, hand_labels)
+    print("    normal vote        UAS %.2f  LAS %.2f" % (uas, hand_las))
+    cv_heads, cv_labels = combiner.cross_validate(outputs)
+    cv_heads, cv_labels = finish_trees(outputs, cv_heads, cv_labels, best_rules)
+    uas, combiner_las = accuracy(sentences, cv_heads, cv_labels)
+    print("    learned combiner   UAS %.2f  LAS %.2f" % (uas, combiner_las))
+
+    use_combiner = combiner_las >= hand_las + COMBINER_MIN_GAIN
+    if use_combiner:
+        print("    -> the normal run will use the learned combiner (+%.2f)" % (combiner_las - hand_las))
+        best_las = combiner_las
+        print_error_report(sentences, cv_heads, cv_labels)
+    else:
+        print("    -> the normal run will use the normal vote (the combiner did not gain %.2f)" % COMBINER_MIN_GAIN)
+        best_las = hand_las
+        print_error_report(sentences, hand_heads, hand_labels)
+    print("FINAL check score with the best choices: LAS %.2f   <- LAS is the competition score" % best_las)
+
+    # Learn the combiner on ALL check sentences, for the normal run.
+    model = combiner.train_combiner(outputs, list(range(len(sentences))))
+    parsers = []
+    for parser_settings in model["parsers"]:
+        parsers.append(list(parser_settings))
+    settings = {}
+    settings["rules"] = best_rules
+    settings["use_combiner"] = bool(use_combiner)
+    settings["normal_vote_las"] = round(hand_las, 2)
+    settings["combiner_las"] = round(combiner_las, 2)
+    settings["combiner"] = {
+        "arc_weights": [float(x) for x in model["arc_weights"]],
+        "label_weights": [float(x) for x in model["label_weights"]],
+        "parsers": parsers,
+        "uses_mst": bool(model["uses_mst"]),
+        "uses_labeler": bool(model["uses_labeler"]),
+    }
+    with open(BEST_SETTINGS, "w", encoding="utf-8") as settings_file:
+        json.dump(settings, settings_file, indent=1)
+    print("Saved the best choices in", BEST_SETTINGS, "(the normal run uses them; commit this file with the code)")
+
+
+def final_trees(outputs):
+    """
+    End of the normal run: the trees for the test sentences, with the best
+    choices from --check (if BEST_SETTINGS exists).
+    """
+    rules = RULES
+    model = None
+    if not os.path.exists(BEST_SETTINGS):
+        print("No", BEST_SETTINGS, "found (run --check first): using RULES and the normal vote")
+    else:
+        with open(BEST_SETTINGS, "r", encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+        rules = settings["rules"]
+        print("Using the best choices from the check run: rules %s" % rules)
+        if settings["use_combiner"]:
+            saved = settings["combiner"]
+            model = {}
+            model["arc_weights"] = np.array(saved["arc_weights"])
+            model["label_weights"] = np.array(saved["label_weights"])
+            current_parsers = []
+            for parser_settings in outputs["parsers"]:
+                current_parsers.append(list(parser_settings))
+            same_mst = saved["uses_mst"] == (outputs["mst"] is not None and outputs["mst"][0] is not None)
+            same_labeler = saved["uses_labeler"] == (outputs["tree_labeler"] is not None)
+            if saved["parsers"] != current_parsers or not same_mst or not same_labeler:
+                print("The check run used different parsers or options: cannot use the learned combiner.")
+                model = None
+
+    if model is not None:
+        print("Using the learned combiner (check data: %.2f LAS, normal vote %.2f)"
+              % (settings["combiner_las"], settings["normal_vote_las"]))
+        heads_of, labels_of = combiner.combine(outputs, model)
+        heads = []
+        labels = []
+        for k in range(len(outputs["sentences"])):
+            heads.append(heads_of[k])
+            labels.append(labels_of[k])
+    else:
+        print("Using the normal vote")
+        heads, labels = normal_vote(outputs)
+    return finish_trees(outputs, heads, labels, rules)
 
 
 def write_final_submission(test_sentences, test_heads, test_labels, train_sentences):
@@ -989,30 +1185,9 @@ def check_mode(all_train):
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
         print("    Chu-Liu/Edmonds ensemble (%d parsers + MST, before rules): UAS %.2f  LAS %.2f" % (len(predictions), uas, las))
 
-    print_rule_table(train_sentences, dev_sentences, voted_heads, voted_labels, dev_upos, punct_forms)
-
-    final_heads, final_labels = apply_rules(dev_sentences, voted_heads, voted_labels, dev_upos, punct_forms, RULES)
-    if COPY_KNOWN_SENTENCES:
-        copied = copy_known_sentences(train_sentences, dev_sentences, final_heads, final_labels)
-        print("Copied the training answer for %d check sentences" % copied)
-    uas, las = accuracy(dev_sentences, final_heads, final_labels)
-    print("FINAL check score with the current settings: UAS %.2f  LAS %.2f   <- LAS is the competition score" % (uas, las))
-
-    cache = {
-        "mode": "check",
-        "train_sentences": train_sentences,
-        "sentences": dev_sentences,
-        "predictions": predictions,
-        "weights": weights,
-        "parsers": list(PARSERS),
-        "tags": dev_tags,
-        "supertags": dev_supertags,
-        "upos": dev_upos,
-        "mst": dev_mst,
-        "tree_labeler": tree_labeler,
-        "punct_forms": punct_forms,
-    }
-    save_cache(CHECK_CACHE, cache)
+    outputs = make_outputs(train_sentences, dev_sentences, predictions, weights, dev_tags,
+                           dev_supertags, dev_upos, dev_mst, tree_labeler, punct_forms)
+    learn_best_settings(outputs)
 
 
 def final_mode(train_sentences):
@@ -1097,39 +1272,10 @@ def final_mode(train_sentences):
         weights.append(weight)
         gc.collect()
 
-    voted_heads, voted_labels = vote(
-        test_predictions,
-        test_sentences,
-        weights,
-        tags_list=test_tags,
-        supertags_list=test_supertags,
-        mst_list=test_mst,
-        upos_list=test_upos,
-        tree_labeler=tree_labeler,
-        punct_forms=punct_forms,
-    )
-    test_heads, test_labels = apply_rules(test_sentences, voted_heads, voted_labels, test_upos, punct_forms, RULES)
-    if COPY_KNOWN_SENTENCES:
-        copied = copy_known_sentences(train_sentences, test_sentences, test_heads, test_labels)
-        print("Copied the training answer for", copied, "test sentences")
-
+    outputs = make_outputs(train_sentences, test_sentences, test_predictions, weights, test_tags,
+                           test_supertags, test_upos, test_mst, tree_labeler, punct_forms)
+    test_heads, test_labels = final_trees(outputs)
     write_final_submission(test_sentences, test_heads, test_labels, train_sentences)
-
-    cache = {
-        "mode": "final",
-        "train_sentences": train_sentences,
-        "sentences": test_sentences,
-        "predictions": test_predictions,
-        "weights": weights,
-        "parsers": list(PARSERS),
-        "tags": test_tags,
-        "supertags": test_supertags,
-        "upos": test_upos,
-        "mst": test_mst,
-        "tree_labeler": tree_labeler,
-        "punct_forms": punct_forms,
-    }
-    save_cache(FINAL_CACHE, cache)
 
 
 def main():

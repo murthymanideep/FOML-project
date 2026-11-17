@@ -13,7 +13,23 @@ counted as correct only if both parts are correct.
 
 No neural networks are used. Everything is built from classic methods:
 **averaged perceptrons** and **structured perceptrons** with hand-made
-features, plus the **Chu-Liu/Edmonds** algorithm to build trees.
+features, **logistic regression**, plus the **Chu-Liu/Edmonds** algorithm to
+build trees.
+
+**No NLP libraries and no hand-written word lists.** The code imports only
+numpy and Python's built-in modules. It contains no lists of English words
+(pronouns, prepositions, ...) and no English grammar rules for word endings.
+Everything about words is either learned from `train.csv` or looks only at
+the characters (capital letters, digits, the last letters of a word):
+
+| What | How we get it |
+|------|---------------|
+| Real punctuation | Word forms labelled `punct` at least 98% of the time in the training data |
+| Pronoun-like words ("he", "it", "my", "who", ...) | Frequent words that are mostly nominals but (almost) never get a determiner, adjective, compound, number or name-part child in the training trees |
+| Possessive markers ("s", "'") | `case` words whose head is (almost) always `nmod:poss` in the training trees |
+| Stem of a word | Its first 5 letters ("computers" -> "compu") |
+| Word ending | Its last 3 letters ("running" -> "ing"); the models learn from the data what each ending means |
+| Different spellings | Apostrophes are removed, so "n't" and "nt" (both in the data) become the same word |
 
 
 ## How to run
@@ -25,38 +41,33 @@ features, plus the **Chu-Liu/Edmonds** algorithm to build trees.
    pip install -r requirements.txt
    ```
 
-3. **Make the submission** (trains on all the training data):
-
-   ```
-   python train_and_predict.py
-   ```
-
-   This writes `outputs/submission.csv` (upload it to Kaggle) and saves all
-   parser outputs in `outputs/final_cache.pkl`.
-
-4. **Check the score** on held-out data (trains on 90% of the training data
-   and tests on the other 10%):
+3. **Check run** (trains on 90% of the training data, tests on the other 10%):
 
    ```
    python train_and_predict.py --check
    ```
 
-   It prints the score of every parser, of the vote, and of the vote with
-   each rule-based fix on and off. It saves all outputs in
-   `outputs/check_cache.pkl`.
+   It prints the score of every parser and of the vote. At the end it
+   chooses the best set of rule-based fixes, tests the learned combiner
+   fairly (Step 5b), prints an error report, and saves these choices in
+   **`best_settings.json`**.
 
-5. **Re-vote without training again** (a few minutes instead of hours):
+4. **Make the submission** (trains on all the training data):
 
    ```
-   python revote.py --check   # compare vote settings on the check data
-   python revote.py           # write outputs/submission.csv again
+   python train_and_predict.py
    ```
 
-   `revote.py` only redoes the last step (the vote and the rule-based fixes),
-   using the saved outputs from steps 3 and 4.
+   This uses the choices in `best_settings.json` (if the file exists) and
+   writes `outputs/submission.csv`. Upload this file to Kaggle.
 
-A full run takes several hours and needs about 2 GB of free memory. The two
-saved output files are about 250 MB each.
+`best_settings.json` is a small text file in the project folder. Commit it
+with the code: then anyone who runs `python train_and_predict.py` later (for
+example to compute the private score) gets exactly the same choices, without
+running `--check` first. Without the file, the run uses `RULES` at the top of
+`train_and_predict.py` and the normal vote.
+
+A full run takes several hours and needs about 2 GB of free memory.
 
 Options for `train_and_predict.py` (they can be combined with `--check`):
 
@@ -68,8 +79,14 @@ Options for `train_and_predict.py` (they can be combined with `--check`):
 
 **Repeatable runs.** The perceptrons use Python's `hash()` to find the table
 row of each feature. Python changes these numbers in every run unless
-`PYTHONHASHSEED` is fixed, so both scripts restart themselves with
-`PYTHONHASHSEED=0`. Now two runs of the same code give the same result.
+`PYTHONHASHSEED` is fixed, so the script restarts itself with
+`PYTHONHASHSEED=0`. All random choices also use fixed seeds, so two runs of
+the same code give the same result.
+
+**No overfitting to the leaderboard.** We never tune anything on the Kaggle
+score. Every choice (the rules, the combiner) is made on our own check data,
+which is separate from the test data, and the combiner is only used if it
+wins under cross-validation. The test answers are never used.
 
 
 ## The files
@@ -77,8 +94,9 @@ row of each feature. Python changes these numbers in every run unless
 | File | What it does |
 |------|--------------|
 | `train_and_predict.py` | The main script. Runs all the steps below. Settings (epochs, the list of parsers, the rule-based fixes) are at the top. |
-| `revote.py` | Redoes only the vote from the saved outputs. Its settings are at the top. |
-| `data_utils.py` | Reads the csv files, writes the submission, computes the score, word helpers (normalising, stemming, word shapes, the word lexicon, the list of real punctuation). |
+| `combiner.py` | The learned combiner (logistic regression written with numpy). |
+| `best_settings.json` | Made by `--check`: the chosen rules and the combiner's weights. Commit it with the code. |
+| `data_utils.py` | Reads the csv files, writes the submission, computes the score, word helpers (normalising, stems, word shapes, the word lexicon) and the word groups learned from the training data (punctuation, pronoun-like words, possessive markers). |
 | `perceptron.py` | The averaged perceptron used by the taggers, transition parsers and labeler. |
 | `tagger.py` | The five taggers. |
 | `parser.py` | The graph-based (MST) parser, the three transition parsers and the full-tree labeler. |
@@ -91,9 +109,10 @@ row of each feature. Python changes these numbers in every run unless
 The data gives us only the words, with no part-of-speech tags. So we first
 train taggers that guess extra information for every word:
 
-1. **Word class** (19 classes such as NOUN, VERB, ADP, PUNCT). We make these
+1. **Word class** (18 classes such as NOUN, VERB, ADP, PUNCT). We make these
    classes ourselves from the training trees: for example a word labelled
-   `det` is DET, a word with a `cop` child is a predicate, and so on.
+   `det` is DET, a word with a `cop` child is a predicate, a learned
+   pronoun-like word is PRON, and so on.
 2. **Relation + side of the head**, read left to right. Example: `det>` means
    "a determiner whose head comes later".
 3. The same, read **right to left**.
@@ -138,6 +157,26 @@ parser and when the parser was more sure. The MST parser adds extra votes.
 Then Chu-Liu/Edmonds picks the best single tree from all the votes, so every
 sentence gets exactly one valid tree with one root. For the labels, the
 parsers vote and the full-tree labeler adds its scores.
+
+### Step 5b: The learned combiner (optional, `combiner.py`)
+
+The vote above uses hand-set numbers (parser weights, MST bonuses, ...).
+The learned combiner learns them from data instead, with **logistic
+regression** (an allowed linear model, written with numpy):
+
+- For every word, the candidate heads are all heads that some parser
+  proposed. Each candidate is described by a few numbers: which parsers
+  chose it, how sure they were, what the MST parser said, the distance, ...
+  The logistic regression learns the chance that the candidate is right, and
+  Chu-Liu/Edmonds builds the best tree from these chances.
+- In the same way, a second logistic regression chooses the label among the
+  labels proposed by the parsers and the full-tree labeler.
+
+It learns from the check data: those parser outputs come from models that
+never saw the check sentences, so they make realistic mistakes. Its score is
+measured fairly with 2-fold cross-validation (learn on one half of the check
+data, test on the other half). It is only used for the submission if it beats
+the normal vote by at least 0.1 points.
 
 ### Step 6: Rule-based fixes
 
@@ -189,10 +228,11 @@ smaller than about 0.2 points are just noise.
 | 5 arc-hybrid parsers, simple vote | 0.7803 |
 | + second-pass tagger, 7 parsers | 0.7811 |
 | Word classes, supertagger, MST parser, full-tree labeler, 12 parsers of 3 kinds, Chu-Liu/Edmonds vote, rules | 0.8199 |
+| + real punctuation decided from the training data (`&`, `$`, `%`, `:)` are not punctuation) | 0.8319 |
 
-The last version still treated symbols like `&`, `$`, `%` and `:)` as
+The 0.8199 version treated symbols like `&`, `$`, `%` and `:)` as
 punctuation. All 83 test words of this kind got the label `punct`, so all 83
-were wrong. This is now fixed (see Step 6).
+were wrong. Fixing this (see Step 6) gave +1.2 points.
 
 Things we tried that did not help enough:
 

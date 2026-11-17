@@ -29,7 +29,6 @@ from data_utils import (
     is_punct_word,
     build_lexicon,
     lookup_word_priors,
-    PASSIVE_AUX_WORDS,
 )
 from perceptron import AveragedPerceptron
 
@@ -2115,7 +2114,7 @@ class FullTreeLabeler:
                     aux_str[u] = ctx.tags[c].rstrip("<>") + ":" + cw
                     if bt == "cop":
                         has_cop[u] = True
-                    if "pass" in ctx.tags[c] or (cw in PASSIVE_AUX_WORDS and ctx.sigs[u].endswith(("VERB_ED", "VERB_EN"))):
+                    if "pass" in ctx.tags[c]:
                         has_pass[u] = True
                 elif bt in ("nsubj", "csubj"):
                     has_subj[u] = True

@@ -22,82 +22,16 @@ import sys
 
 ROOT_WORD = "<ROOT>"
 
-# Common English function / closed-class word sets for syntactic disambiguation
-PASSIVE_AUX_WORDS = {
-    "be", "am", "is", "are", "was", "were", "been", "being",
-    "get", "gets", "got", "gotten", "getting",
+# Groups of relation labels (these label names come from the training data).
+# They are used to LEARN word groups from the training trees, so the code
+# needs no hand-written lists of English words.
+NOMINAL_LABELS = {
+    "nsubj", "nsubj:pass", "nsubj:outer", "obj", "iobj", "obl", "obl:unmarked",
+    "obl:agent", "nmod", "nmod:poss", "nmod:unmarked", "nmod:desc", "expl",
+    "appos", "vocative", "dislocated",
 }
-POSSESSIVE_PRONOUNS = {
-    "my", "your", "his", "her", "its", "our", "their", "whose", "thy",
-}
-PRONOUN_WORDS = {
-    "i", "you", "he", "she", "it", "we", "they", "me", "him", "us", "them",
-    "myself", "yourself", "himself", "herself", "itself", "ourselves",
-    "yourselves", "themselves", "mine", "yours", "hers", "ours", "theirs",
-    "who", "whom", "whose", "whoever", "whomever", "what", "whatever",
-    "which", "whichever", "someone", "somebody", "something", "anyone",
-    "anybody", "anything", "everyone", "everybody", "everything", "noone",
-    "nobody", "nothing", "one", "ones", "none", "each", "either", "neither",
-    "this", "that", "these", "those", "my", "your", "his", "her", "its",
-    "our", "their", "thy", "thee", "thou",
-}
-RELATIVE_WORDS = {
-    "who", "whom", "whose", "which", "that", "where", "when", "why",
-    "whoever", "whomever", "whichever", "whatever",
-}
-PRT_WORDS = {
-    "up", "out", "down", "off", "on", "in", "over", "back", "away",
-    "around", "through", "together", "apart", "along", "forward",
-    "ahead", "aside", "about", "by", "across", "open", "shut",
-}
-PUNCT_TOKENS = {
-    ".", ",", ":", ";", "!", "?", "-", "--", "---", "(", ")", "[", "]",
-    "{", "}", "\"", "'", "''", "``", "/", "\\", "...", "....", ".....",
-    "*", "&", "??", "???", "!!", "!!!", ":)", ":(", ";)", ":-)",
-}
-CLOSED_CLASS_WORDS = {
-    "the", "a", "an", "this", "that", "these", "those", "my", "your", "his",
-    "her", "its", "our", "their", "some", "any", "no", "every", "each", "either",
-    "neither", "both", "all", "half", "several", "many", "much", "few", "little",
-    "other", "another", "such", "what", "whatever", "which", "whichever", "who",
-    "whom", "whose", "where", "when", "why", "how", "i", "you", "he", "she",
-    "it", "we", "they", "me", "him", "us", "them", "myself", "yourself",
-    "himself", "herself", "itself", "ourselves", "themselves", "someone",
-    "anyone", "everyone", "noone", "nobody", "anybody", "everybody", "somebody",
-    "something", "anything", "everything", "nothing", "one", "ones", "none",
-    "in", "on", "at", "to", "for", "with", "from", "by", "about", "as", "into",
-    "like", "through", "after", "over", "between", "out", "against", "during",
-    "without", "before", "under", "around", "among", "of", "off", "up", "down",
-    "near", "toward", "towards", "upon", "within", "along", "following", "across",
-    "behind", "beyond", "plus", "except", "but", "per", "via", "despite", "onto",
-    "throughout", "besides", "above", "below", "since", "until", "till", "while",
-    "although", "though", "because", "if", "unless", "whether", "whereas", "so",
-    "and", "or", "nor", "yet", "not", "n't", "never", "always", "also", "very",
-    "too", "just", "only", "even", "still", "already", "almost", "quite", "rather",
-    "here", "there", "now", "then", "today", "yesterday", "tomorrow", "again",
-    "ever", "perhaps", "maybe", "well", "however", "therefore", "thus", "instead",
-    "be", "am", "is", "are", "was", "were", "been", "being", "have", "has", "had",
-    "having", "do", "does", "did", "doing", "done", "will", "would", "shall",
-    "should", "can", "could", "may", "might", "must", "ca", "wo", "sha",
-    "'s", "'m", "'ve", "'re", "'ll", "'d",
-}
-
-# Stripped clitic normalization map (handles missing apostrophes in train/test)
-_STRIPPED_CLITICS = {
-    "s": "'s",
-    "’s": "'s",
-    "m": "'m",
-    "’m": "'m",
-    "ve": "'ve",
-    "’ve": "'ve",
-    "re": "'re",
-    "’re": "'re",
-    "ll": "'ll",
-    "’ll": "'ll",
-    "d": "'d",
-    "’d": "'d",
-    "nt": "n't",
-    "n’t": "n't",
+MODIFIER_LABELS = {
+    "det", "det:predet", "amod", "compound", "nmod:poss", "nummod", "flat", "nmod",
 }
 
 
@@ -105,9 +39,12 @@ def is_punct_word(word):
     """Return True if the token is purely punctuation or an empty quote token."""
     if word == ROOT_WORD:
         return False
-    if word == "" or word in PUNCT_TOKENS:
+    if word == "":
         return True
-    return not any(c.isalnum() for c in word)
+    for character in word:
+        if character.isalnum():
+            return False
+    return True
 
 
 def find_punct_forms(sentences, min_share=0.98, min_count=3):
@@ -233,8 +170,14 @@ def accuracy(sentences, predicted_heads, predicted_labels):
 
 def normalize_word(word):
     """
-    Lower-case a word and normalize stripped clitics, empty quotes, numbers,
-    years, ordinals, percentages, currencies, and URLs.
+    Lower-case a word, remove apostrophes, and replace numbers, years,
+    percentages, amounts of money, times, URLs and e-mail addresses by a
+    common symbol.
+
+    Why remove apostrophes: in this data most apostrophes were already
+    removed ("Bing s rush", "we ve"), but a few are still there ("n't",
+    "’s"). Removing all of them makes both spellings the same word, so they
+    share what the models learn about them.
     """
     if word == ROOT_WORD:
         return word
@@ -244,8 +187,9 @@ def normalize_word(word):
         return '"'
 
     low = word.lower()
-    if low in _STRIPPED_CLITICS:
-        return _STRIPPED_CLITICS[low]
+    without_apostrophes = low.replace("'", "").replace("’", "")
+    if without_apostrophes != "":
+        low = without_apostrophes
 
     if low.startswith("http://") or low.startswith("https://") or low.startswith("www."):
         return "<URL>"
@@ -253,8 +197,6 @@ def normalize_word(word):
         return "<EMAIL>"
     if word.isdigit() and len(word) == 4 and (word.startswith("18") or word.startswith("19") or word.startswith("20")):
         return "<YEAR>"
-    if len(low) >= 3 and low[:-2].isdigit() and low[-2:] in ("st", "nd", "rd", "th"):
-        return "<ORDINAL>"
     if len(low) >= 2 and low[-1] == "%" and any(c.isdigit() for c in low[:-1]):
         return "<PERCENT>"
     if len(low) >= 2 and low[0] in ("$", "£", "€", "¥") and any(c.isdigit() for c in low[1:]):
@@ -269,48 +211,20 @@ def normalize_word(word):
     return low
 
 
+STEM_LENGTH = 5
+
+
 def stem_word(norm_word):
     """
-    Lightweight rule-based English morphological stemmer for sharing lexical
-    statistics across inflections (e.g. 'argues'/'argued'/'arguing' -> 'argu',
-    'policies' -> 'policy', 'computers' -> 'computer').
+    A very simple stem that needs no knowledge of English: the first
+    STEM_LENGTH letters of the word. Words that start the same way usually
+    belong together ("computer", "computers" -> "compu"; "policy",
+    "policies" -> "polic"), so they can share their statistics.
+    Short words, numbers and special symbols stay as they are.
     """
-    if (
-        len(norm_word) <= 3
-        or norm_word[0] == "<"
-        or norm_word in CLOSED_CLASS_WORDS
-        or not norm_word.isalpha()
-    ):
+    if len(norm_word) <= STEM_LENGTH or norm_word[0] == "<" or not norm_word.isalpha():
         return norm_word
-
-    if norm_word.endswith("ies") and len(norm_word) > 4:
-        return norm_word[:-3] + "y"
-    if norm_word.endswith("ied") and len(norm_word) > 4:
-        return norm_word[:-3] + "y"
-    if norm_word.endswith("ing") and len(norm_word) > 5:
-        base = norm_word[:-3]
-        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
-            return base[:-1]
-        if len(base) >= 3 and base[-1] in "cgv" and not base.endswith(("ck", "ng")):
-            return base + "e"
-        return base
-    if norm_word.endswith("ed") and len(norm_word) > 4 and not norm_word.endswith("eed"):
-        base = norm_word[:-2]
-        if len(base) >= 3 and base[-1] == base[-2] and base[-1] not in "aeioulsz":
-            return base[:-1]
-        return base
-    if norm_word.endswith("es") and len(norm_word) > 4:
-        if norm_word.endswith(("ches", "shes", "sses", "zzes", "xes")):
-            return norm_word[:-2]
-        if norm_word.endswith("ves") and len(norm_word) > 4:
-            return norm_word[:-3] + "f"
-    if (
-        norm_word.endswith("s")
-        and len(norm_word) > 3
-        and not norm_word.endswith(("ss", "us", "is", "as", "os"))
-    ):
-        return norm_word[:-1]
-    return norm_word
+    return norm_word[:STEM_LENGTH]
 
 
 def word_shape(word):
@@ -335,86 +249,126 @@ def word_shape(word):
     return shape
 
 
-# Informative English derivational and inflectional suffixes (checked longest first)
-_SUFFIX_CLASSES = (
-    ("ations", "NOUN_ION"), ("ition", "NOUN_ION"), ("ation", "NOUN_ION"),
-    ("ments", "NOUN_MENT"), ("ment", "NOUN_MENT"),
-    ("nesses", "NOUN_NESS"), ("ness", "NOUN_NESS"),
-    ("ities", "NOUN_ITY"), ("ity", "NOUN_ITY"),
-    ("ships", "NOUN_SHIP"), ("ship", "NOUN_SHIP"),
-    ("wards", "ADV_WARD"), ("ward", "ADV_WARD"),
-    ("fully", "ADV_LY"), ("lessly", "ADV_LY"), ("ably", "ADV_LY"),
-    ("ibly", "ADV_LY"), ("ally", "ADV_LY"), ("ively", "ADV_LY"),
-    ("ously", "ADV_LY"), ("ly", "ADV_LY"),
-    ("able", "ADJ_ABLE"), ("ible", "ADJ_ABLE"),
-    ("less", "ADJ_LESS"), ("ful", "ADJ_FUL"),
-    ("ious", "ADJ_OUS"), ("eous", "ADJ_OUS"), ("ous", "ADJ_OUS"),
-    ("ical", "ADJ_AL"), ("ial", "ADJ_AL"), ("ual", "ADJ_AL"), ("al", "ADJ_AL"),
-    ("ive", "ADJ_IVE"), ("ish", "ADJ_ISH"), ("ic", "ADJ_IC"),
-    ("est", "ADJ_EST"),
-    ("ings", "VERB_ING"), ("ing", "VERB_ING"),
-    ("ed", "VERB_ED"), ("en", "VERB_EN"),
-    ("izes", "VERB_IZE"), ("ized", "VERB_IZE"), ("ize", "VERB_IZE"),
-    ("ises", "VERB_IZE"), ("ised", "VERB_IZE"), ("ise", "VERB_IZE"),
-    ("ifies", "VERB_FY"), ("ified", "VERB_FY"), ("ify", "VERB_FY"),
-    ("ates", "VERB_ATE"), ("ated", "VERB_ATE"), ("ate", "VERB_ATE"),
-    ("ers", "NOUN_ER"), ("ors", "NOUN_ER"), ("er", "ER"), ("or", "OR"),
-    ("ists", "NOUN_IST"), ("ist", "NOUN_IST"), ("ism", "NOUN_ISM"),
-    ("ion", "NOUN_ION"), ("ies", "PL_IES"), ("es", "PL_ES"), ("s", "PL_S"),
-)
-
-
 def word_signature(word, position=1):
     """
-    Morphological & orthographic signature for rare/unseen word generalization.
-    Distinguishes Proper Nouns (MID_PROPN / INIT_PROPN) from capitalized
-    closed-class words and extracts suffix families.
+    How a word looks, for rare or unseen words. Uses only the characters,
+    no knowledge of English:
+      * capital letters: ALL_CAP ("NASA"), INIT_CAP (capital, first word of
+        the sentence), MID_CAP (capital, later in the sentence - often a
+        name), MIX_CAP ("iPhone"), LOW (no capitals)
+      * digits (DIG) and hyphens (HYP)
+      * the last 3 letters ("END_ion", "END_ing", ...) for words of 4 or more
+        letters, otherwise the length ("LEN_2"). The models learn from the
+        training data what each ending usually means.
+    Example: "Mississauga" (not first word) -> "MID_CAP|||END_uga"
     """
     if word == ROOT_WORD:
         return "ROOT"
     if word == "" or is_punct_word(word):
         return "PUNCT"
 
-    norm = normalize_word(word)
-    if norm in ("'s", "'m", "'ve", "'re", "'ll", "'d", "n't"):
-        return "CLITIC_" + norm
+    has_letter = False
+    has_upper = False
+    for character in word:
+        if character.isalpha():
+            has_letter = True
+        if character.isupper():
+            has_upper = True
 
-    is_closed = norm in CLOSED_CLASS_WORDS
-
-    if word.isupper() and any(c.isalpha() for c in word):
-        cap = "ALL_CAP_CLOSED" if is_closed else "ALL_CAP_PROPN"
+    if has_letter and word.isupper():
+        cap = "ALL_CAP"
     elif word[0].isupper():
-        if is_closed:
-            cap = "CAP_CLOSED"
-        elif position == 1:
-            cap = "INIT_CAP_OPEN"
+        if position == 1:
+            cap = "INIT_CAP"
         else:
-            cap = "MID_PROPN"
-    elif any(c.isupper() for c in word):
-        cap = "MIX_PROPN"
+            cap = "MID_CAP"
+    elif has_upper:
+        cap = "MIX_CAP"
     else:
         cap = "LOW"
 
-    has_digit = "DIG" if any(c.isdigit() for c in word) else ""
-    has_hyphen = "HYP" if ("-" in word and len(word) > 1) else ""
+    has_digit = ""
+    for character in word:
+        if character.isdigit():
+            has_digit = "DIG"
+    has_hyphen = ""
+    if "-" in word and len(word) > 1:
+        has_hyphen = "HYP"
 
-    low = word.lower()
-    tail = low.rsplit("-", 1)[-1] if has_hyphen else low
+    tail = normalize_word(word)
+    if has_hyphen:
+        tail = word.lower().rsplit("-", 1)[-1]
+    if len(tail) >= 4:
+        ending = "END_" + tail[-3:]
+    else:
+        ending = "LEN_" + str(len(tail))
 
-    suf_class = "NONE"
-    if len(tail) >= 3:
-        for suf, label in _SUFFIX_CLASSES:
-            if tail.endswith(suf) and len(tail) > len(suf) + 1:
-                suf_class = label
-                break
-        if suf_class == "NONE":
-            suf_class = "END_" + tail[-2:]
-    elif len(tail) == 2 and cap == "MID_PROPN":
-        suf_class = "SHORT_PROPN"
-    elif len(tail) == 1 and cap in ("MID_PROPN", "ALL_CAP_PROPN"):
-        suf_class = "INITIAL_PROPN"
+    return cap + "|" + has_digit + "|" + has_hyphen + "|" + ending
 
-    return cap + "|" + has_digit + "|" + has_hyphen + "|" + suf_class
+
+def find_standalone_nominals(sentences, min_count=10):
+    """
+    LEARN "pronoun-like" words from the training trees: frequent words that
+    are mostly used as a nominal (subject, object, possessor, ...) but almost
+    never get a determiner, adjective, compound, number or name-part child.
+
+    From this data it learns words like "he", "it", "you", "my", "who",
+    "themselves", but also some frequent names ("london", "nasa") and words
+    like "today": they all stand alone in a sentence in the same way.
+    No hand-made list of English words is used.
+    """
+    count = {}
+    as_nominal = {}
+    with_modifier = {}
+    for sentence in sentences:
+        n = len(sentence["words"]) - 1
+        children = []
+        for i in range(n + 1):
+            children.append([])
+        for i in range(1, n + 1):
+            children[sentence["heads"][i]].append(i)
+        for i in range(1, n + 1):
+            word = normalize_word(sentence["words"][i])
+            count[word] = count.get(word, 0) + 1
+            if sentence["labels"][i] in NOMINAL_LABELS:
+                as_nominal[word] = as_nominal.get(word, 0) + 1
+            for child in children[i]:
+                if sentence["labels"][child] in MODIFIER_LABELS:
+                    with_modifier[word] = with_modifier.get(word, 0) + 1
+                    break
+
+    words = set()
+    for word in count:
+        if count[word] < min_count:
+            continue
+        if as_nominal.get(word, 0) >= 0.6 * count[word] and with_modifier.get(word, 0) <= 0.02 * count[word]:
+            words.add(word)
+    return words
+
+
+def find_possessive_markers(sentences, min_count=5):
+    """
+    LEARN the possessive markers from the training trees: words labelled
+    "case" whose head is almost always labelled "nmod:poss" (in this data
+    the possessive "s" and the empty apostrophe token).
+    """
+    as_case = {}
+    as_possessive = {}
+    for sentence in sentences:
+        for i in range(1, len(sentence["words"])):
+            if sentence["labels"][i] != "case":
+                continue
+            word = normalize_word(sentence["words"][i])
+            as_case[word] = as_case.get(word, 0) + 1
+            head = sentence["heads"][i]
+            if head > 0 and sentence["labels"][head] == "nmod:poss":
+                as_possessive[word] = as_possessive.get(word, 0) + 1
+
+    markers = set()
+    for word in as_case:
+        if as_case[word] >= min_count and as_possessive.get(word, 0) >= 0.8 * as_case[word]:
+            markers.add(word)
+    return markers
 
 
 def base_label(tag_or_label):
@@ -616,7 +570,7 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
     total = lexicon["word_totals"].get(normal_word, 0)
     sig = word_signature(raw_word, position)
 
-    if total >= 2 and not (sig.startswith("MID_PROPN") and total <= 3 and not raw_word.islower()):
+    if total >= 2 and not (sig.startswith("MID_CAP") and total <= 3 and not raw_word.islower()):
         dom = lexicon["dominant_tag"][normal_word]
         amb = lexicon["ambiguity_class"][normal_word]
         crs = lexicon["dominant_coarse"][normal_word]
@@ -634,7 +588,7 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
     # Fallback 1: check morphological stem if the word is not a mid-sentence proper noun
     st = stem_word(normal_word)
     st_total = lexicon.get("stem_totals", {}).get(st, 0)
-    if st != normal_word and st_total >= 4 and not sig.startswith("MID_PROPN"):
+    if st != normal_word and st_total >= 4 and not sig.startswith("MID_CAP"):
         dom = lexicon["stem_dominant"][st]
         amb = lexicon["stem_ambiguity"][st]
         crs = coarse_group(dom)
