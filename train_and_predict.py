@@ -14,7 +14,6 @@ Chu-Liu/Edmonds Maximum Spanning Arborescence and writes the submission file.
 Extra options (can be combined with --check):
     --one-parser       train only the first parser (fast, for experiments)
     --no-second-pass   do not use the second-pass tagger, supertagger & MST guide
-    --no-copy          do not copy answers of sentences seen in training
 
 Run --check FIRST. At its end it learns, from the check data:
   * the learned combiner (logistic regression, see combiner.py), and
@@ -103,7 +102,6 @@ PARSERS = [
 ]
 
 USE_SECOND_PASS_TAGGER = True
-COPY_KNOWN_SENTENCES = True
 
 # Check split (--check): the training sentences are cut into groups of this
 # many neighbouring sentences, and every 10th group is the check data.
@@ -407,58 +405,6 @@ def make_mst_guides(
     mst_model_2 = None
     gc.collect()
     return train_mst, other_mst_lists
-
-
-def copy_known_sentences(train_sentences, sentences, all_heads, all_labels):
-    """
-    If a sentence has the same words (or unambiguous normalized words) as a
-    training sentence, use the majority training parse for it.
-    """
-    exact_counts = {}
-    norm_counts = {}
-
-    for sentence in train_sentences:
-        exact_key = "\t".join(sentence["words"])
-        norm_key = "\t".join(normalize_word(w) for w in sentence["words"])
-        ans = (tuple(sentence["heads"]), tuple(sentence["labels"]))
-
-        ec = exact_counts.get(exact_key)
-        if ec is None:
-            ec = {}
-            exact_counts[exact_key] = ec
-        ec[ans] = ec.get(ans, 0) + 1
-
-        nc = norm_counts.get(norm_key)
-        if nc is None:
-            nc = {}
-            norm_counts[norm_key] = nc
-        nc[ans] = nc.get(ans, 0) + 1
-
-    exact_best = {}
-    for key, counts in exact_counts.items():
-        sorted_ans = sorted(counts.items(), key=lambda kv: -kv[1])
-        total = sum(counts.values())
-        if sorted_ans[0][1] >= 0.75 * total:
-            exact_best[key] = (list(sorted_ans[0][0][0]), list(sorted_ans[0][0][1]))
-
-    norm_best = {}
-    for key, counts in norm_counts.items():
-        if len(counts) == 1:
-            ans = next(iter(counts.keys()))
-            norm_best[key] = (list(ans[0]), list(ans[1]))
-
-    copied = 0
-    for k in range(len(sentences)):
-        exact_key = "\t".join(sentences[k]["words"])
-        answer = exact_best.get(exact_key)
-        if answer is None and len(sentences[k]["words"]) >= 3:
-            norm_key = "\t".join(normalize_word(w) for w in sentences[k]["words"])
-            answer = norm_best.get(norm_key)
-        if answer is not None:
-            all_heads[k] = list(answer[0])
-            all_labels[k] = list(answer[1])
-            copied += 1
-    return copied
 
 
 def train_one_parser(
@@ -852,7 +798,6 @@ RULE_VARIANTS = [
 def make_outputs(train_sentences, sentences, predictions, weights, tags, supertags, upos, mst, tree_labeler, punct_forms):
     """Put everything the last step needs in one dictionary (plus word groups learned from the training data)."""
     outputs = {}
-    outputs["train_sentences"] = train_sentences
     outputs["sentences"] = sentences
     outputs["predictions"] = predictions
     outputs["weights"] = weights
@@ -883,12 +828,10 @@ def normal_vote(outputs):
 
 
 def finish_trees(outputs, heads, labels, rules):
-    """Rule-based fixes, then copying the answers of known sentences."""
+    """Apply the chosen rule-based fixes."""
     sentences = outputs["sentences"]
     heads, labels = apply_rules(sentences, heads, labels, outputs["upos"], outputs["punct_forms"], rules,
                                 outputs["possessive_markers"])
-    if COPY_KNOWN_SENTENCES:
-        copy_known_sentences(outputs["train_sentences"], sentences, heads, labels)
     return heads, labels
 
 
@@ -1279,7 +1222,7 @@ def final_mode(train_sentences):
 
 
 def main():
-    global PARSERS, USE_SECOND_PASS_TAGGER, COPY_KNOWN_SENTENCES
+    global PARSERS, USE_SECOND_PASS_TAGGER
     # Must come first: restarts the script with repeatable hashing if needed.
     make_hashing_repeatable()
 
@@ -1287,8 +1230,6 @@ def main():
         PARSERS = PARSERS[:1]
     if "--no-second-pass" in sys.argv:
         USE_SECOND_PASS_TAGGER = False
-    if "--no-copy" in sys.argv:
-        COPY_KNOWN_SENTENCES = False
     start_time = time.time()
     train_sentences = read_sentences(os.path.join(DATA_FOLDER, "train.csv"))
     if "--check" in sys.argv:

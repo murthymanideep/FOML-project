@@ -75,7 +75,6 @@ Options for `train_and_predict.py` (they can be combined with `--check`):
 |--------|---------|
 | `--one-parser` | Train only the first transition parser instead of 12. |
 | `--no-second-pass` | Do not use the second-pass tagger, the supertagger, the MST guide and the tree labeler. |
-| `--no-copy` | Do not copy the answers of sentences seen in training. |
 
 **Repeatable runs.** The perceptrons use Python's `hash()` to find the table
 row of each feature. Python changes these numbers in every run unless
@@ -86,7 +85,14 @@ the same code give the same result.
 **No overfitting to the leaderboard.** We never tune anything on the Kaggle
 score. Every choice (the rules, the combiner) is made on our own check data,
 which is separate from the test data, and the combiner is only used if it
-wins under cross-validation. The test answers are never used.
+wins under cross-validation. The test answers are never used, and no answer
+is copied from the training data: every test sentence is parsed by the
+models, even if the same sentence appears in `train.csv`.
+
+The public score uses only about 6% of the test words (about 1,500 words), so
+it can move by about 1 point just by chance. The private score uses the other
+94%. Our check data (about 20,000 words) is a much more reliable guide, so we
+make all decisions on it.
 
 
 ## The files
@@ -194,12 +200,6 @@ noun and `:)` is `discourse`. A word form counts as punctuation only if the
 training data labels it `punct` at least 98% of the time (47 forms such as
 `.` `,` `?` `!` `(` `)` `"`).
 
-### Step 7: Known sentences
-
-If a test sentence has exactly the same words as a training sentence (for
-example "Thanks !"), we copy the training answer.
-
-
 ## Checking our work
 
 `--check` cuts the training sentences into **groups of 100 neighbouring
@@ -246,5 +246,7 @@ Things we tried that did not help enough:
 
 `data/sample.csv` has the columns `ID,Label` and lists the IDs of **both**
 the training rows and the test rows. Our submission has one row for every ID
-in `sample.csv`, in the same order. Kaggle only scores the test rows, so the
-training rows are simply filled with their known answers.
+in `sample.csv`, in the same order. Kaggle only scores the test rows (about 6%
+of them for the public score, the other 94% for the private score). The
+training rows are not scored, so they are simply filled with their answers
+from `train.csv`.
