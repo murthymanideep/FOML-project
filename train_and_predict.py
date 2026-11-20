@@ -41,6 +41,7 @@ from data_utils import (
     find_possessive_markers,
     make_hashing_repeatable,
     build_lexicon,
+    build_word_clusters,
 )
 from tagger import (
     train_tagger,
@@ -55,6 +56,7 @@ from parser import (
     ArcEagerParser,
     ArcStandardParser,
     GraphMSTParser,
+    SecondOrderTreeModel,
     FullTreeLabeler,
     jackknife_mst,
     chu_liu_edmonds,
@@ -80,6 +82,7 @@ UPOS_EPOCHS = 6
 TAGGER_EPOCHS = 6
 SUPERTAGGER_EPOCHS = 5
 MST_EPOCHS = 8
+SECOND_ORDER_EPOCHS = 5
 TREE_LABELER_EPOCHS = 6
 JACKKNIFE_FOLDS = 5
 PARSER_EPOCHS = 12
@@ -144,11 +147,11 @@ def get_label_names(sentences):
     return sorted(names)
 
 
-def make_tags(train_sentences, other_sentence_lists):
+def make_tags(train_sentences, other_sentence_lists, word_clusters=None):
     """
     Tag the training sentences with 5-fold jackknifing, and the other sentences
     (dev or test) with taggers trained on all training sentences:
-      0. Induced Universal POS (`UPOS`) tagger (19 syntactic classes induced from gold trees)
+      0. Induced Universal POS (`UPOS`) tagger (17 syntactic classes induced from gold trees)
       1. Pass-1 Forward (Left-to-Right) tagger conditioned on `UPOS`
       2. Pass-1 Backward (Right-to-Left) tagger conditioned on `UPOS`
       3. Pass-2 Stacked tagger conditioned on Forward + Backward tags + `UPOS` + Global Lookahead
@@ -160,12 +163,23 @@ def make_tags(train_sentences, other_sentence_lists):
 
     print("Training the Induced UPOS tagger (jackknifing for training data)...")
     train_upos = jackknife_tags(
-        upos_sentences, upos_names, UPOS_EPOCHS, JACKKNIFE_FOLDS, direction="left-to-right"
+        upos_sentences,
+        upos_names,
+        UPOS_EPOCHS,
+        JACKKNIFE_FOLDS,
+        direction="left-to-right",
+        word_clusters=word_clusters,
     )
     print("    Induced UPOS accuracy on training data (jackknifed): %.2f" % tag_accuracy(upos_sentences, train_upos))
 
     print("Training the Induced UPOS tagger on all training sentences...")
-    upos_tagger = train_tagger(upos_sentences, upos_names, UPOS_EPOCHS, direction="left-to-right")
+    upos_tagger = train_tagger(
+        upos_sentences,
+        upos_names,
+        UPOS_EPOCHS,
+        direction="left-to-right",
+        word_clusters=word_clusters,
+    )
     other_upos_lists = []
     for sentences in other_sentence_lists:
         u_list = [upos_tagger.tag(sentence["words"]) for sentence in sentences]
@@ -185,6 +199,7 @@ def make_tags(train_sentences, other_sentence_lists):
         JACKKNIFE_FOLDS,
         direction="left-to-right",
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     print("    L-to-R tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_fwd))
 
@@ -195,6 +210,7 @@ def make_tags(train_sentences, other_sentence_lists):
         TAGGER_EPOCHS,
         direction="left-to-right",
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     other_tags_fwd = []
     for j in range(len(other_sentence_lists)):
@@ -227,6 +243,7 @@ def make_tags(train_sentences, other_sentence_lists):
         JACKKNIFE_FOLDS,
         direction="right-to-left",
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     print("    R-to-L tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_bwd))
 
@@ -237,6 +254,7 @@ def make_tags(train_sentences, other_sentence_lists):
         TAGGER_EPOCHS,
         direction="right-to-left",
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     other_tags_bwd = []
     for j in range(len(other_sentence_lists)):
@@ -260,6 +278,7 @@ def make_tags(train_sentences, other_sentence_lists):
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     print("    second-pass tag accuracy on training data (jackknifed): %.2f" % tag_accuracy(tag_sentences, train_tags_2))
 
@@ -272,6 +291,7 @@ def make_tags(train_sentences, other_sentence_lists):
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     other_tags_lists_2 = []
     for j in range(len(other_sentence_lists)):
@@ -302,6 +322,7 @@ def make_tags(train_sentences, other_sentence_lists):
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     print("    supertag accuracy on training data (jackknifed): %.2f" % tag_accuracy(super_sentences, train_supertags))
 
@@ -314,6 +335,7 @@ def make_tags(train_sentences, other_sentence_lists):
         direction="left-to-right",
         backward_tags_list=train_tags_bwd,
         upos_tags_list=train_upos,
+        word_clusters=word_clusters,
     )
     other_super_lists = []
     for j in range(len(other_sentence_lists)):
@@ -351,6 +373,7 @@ def make_mst_guides(
     other_super_lists,
     other_upos_lists,
     lexicon_ltr,
+    word_clusters=None,
 ):
     """
     Train the Global First-Order Graph-Based MST Structured Perceptron:
@@ -369,6 +392,7 @@ def make_mst_guides(
         upos_list=train_upos,
         epochs=MST_EPOCHS,
         n_folds=JACKKNIFE_FOLDS,
+        word_clusters=word_clusters,
     )
     mst_train_heads = [m["heads"] for m in train_mst]
     dummy_labels = [["root"] * len(s["words"]) for s in train_sentences]
@@ -642,15 +666,18 @@ def vote(
     mst_list=None,
     upos_list=None,
     tree_labeler=None,
+    tree_labeler_2=None,
+    second_order=None,
     punct_forms=None,
 ):
     """
     Combine all parsers via:
       1. Margin-confidence-weighted arc score matrix construction (combining all
          12 transition parsers across 3 transition systems + 2-seed Global Graph-MST).
-      2. Single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding.
-      3. Full-tree 2nd/3rd-order label scoring (`FullTreeLabeler`) blended with
-         the transition ensemble's confidence-weighted label votes.
+      2. Single-root Chu-Liu/Edmonds Maximum Spanning Arborescence decoding,
+         refined by the Second-Order Grandparent/Sibling/Valency/Crossing model.
+      3. 2-seed Full-tree 2nd/3rd-order label scoring (`FullTreeLabeler`) blended
+         with the transition ensemble's confidence-weighted label votes.
     The rule-based fixes are NOT applied here; call apply_rules afterwards.
 
     punct_forms: word forms that are almost always "punct" in the training
@@ -688,6 +715,8 @@ def vote(
                 else:
                     arc_scores[h, m] = 0.0
 
+        cands_per_tok = [[] for _ in range(n + 1)]
+
         # Add confidence-weighted votes from every transition parser
         for p_idx, pred_tuple in enumerate(predictions):
             all_heads = pred_tuple[0]
@@ -699,6 +728,8 @@ def vote(
                     marg = all_margins[k][i] if all_margins is not None else 4.0
                     conf_mult = 0.85 + 0.30 * (min(max(marg, 0.0), 12.0) / 12.0)
                     arc_scores[h, i] += w_p * conf_mult - 1.0e-5 * p_idx
+                    if h not in cands_per_tok[i]:
+                        cands_per_tok[i].append(h)
 
         # Add 2-seed Global Graph-MST structural votes when available
         if mst_list is not None and mst_list[k] is not None:
@@ -714,21 +745,41 @@ def vote(
                 if 0 <= h1 <= n and h1 != i:
                     bonus = 1.05 if mconf[i] == "HIGH" else (0.72 if mconf[i] == "MID" else 0.45)
                     arc_scores[h1, i] += bonus
+                    if h1 not in cands_per_tok[i]:
+                        cands_per_tok[i].append(h1)
                 if 0 <= h2 <= n and h2 != i:
                     arc_scores[h2, i] += 0.22
+                    if h2 not in cands_per_tok[i]:
+                        cands_per_tok[i].append(h2)
                 if 0 <= h3 <= n and h3 != i:
                     arc_scores[h3, i] += 0.08
+                    if h3 not in cands_per_tok[i]:
+                        cands_per_tok[i].append(h3)
 
         # Decode exact single-root Maximum Spanning Arborescence via Chu-Liu/Edmonds
         heads = chu_liu_edmonds(arc_scores)
 
+        # Refine with Second-Order Grandparent/Sibling/Valency/Crossing model when available
+        utags = upos_list[k] if upos_list is not None else None
+        stags = supertags_list[k] if supertags_list is not None else None
+        if second_order is not None and tags_list is not None and n >= 2:
+            heads = second_order.refine_tree(
+                words,
+                tags_list[k],
+                stags,
+                utags,
+                arc_scores,
+                cands_per_tok,
+                init_heads=heads,
+                alpha=0.22,
+                n_passes=2,
+            )
+
         # Compute full-tree label scores when `tree_labeler` is available
         tree_scores = None
-        utags = upos_list[k] if upos_list is not None else None
         if tree_labeler is not None and tags_list is not None:
-            stags = supertags_list[k] if supertags_list is not None else None
             tree_scores = tree_labeler.score_sentence_labels(
-                words, tags_list[k], stags, heads, upos=utags
+                words, tags_list[k], stags, heads, upos=utags, second_model=tree_labeler_2
             )
 
         labels = [""] * (n + 1)
@@ -795,7 +846,20 @@ RULE_VARIANTS = [
 ]
 
 
-def make_outputs(train_sentences, sentences, predictions, weights, tags, supertags, upos, mst, tree_labeler, punct_forms):
+def make_outputs(
+    train_sentences,
+    sentences,
+    predictions,
+    weights,
+    tags,
+    supertags,
+    upos,
+    mst,
+    tree_labeler,
+    punct_forms,
+    tree_labeler_2=None,
+    second_order=None,
+):
     """Put everything the last step needs in one dictionary (plus word groups learned from the training data)."""
     outputs = {}
     outputs["sentences"] = sentences
@@ -807,6 +871,8 @@ def make_outputs(train_sentences, sentences, predictions, weights, tags, superta
     outputs["upos"] = upos
     outputs["mst"] = mst
     outputs["tree_labeler"] = tree_labeler
+    outputs["tree_labeler_2"] = tree_labeler_2
+    outputs["second_order"] = second_order
     outputs["punct_forms"] = punct_forms
     outputs["possessive_markers"] = find_possessive_markers(train_sentences)
     return outputs
@@ -823,6 +889,8 @@ def normal_vote(outputs):
         mst_list=outputs["mst"],
         upos_list=outputs["upos"],
         tree_labeler=outputs["tree_labeler"],
+        tree_labeler_2=outputs.get("tree_labeler_2"),
+        second_order=outputs.get("second_order"),
         punct_forms=outputs["punct_forms"],
     )
 
@@ -942,6 +1010,7 @@ def learn_best_settings(outputs):
         "parsers": parsers,
         "uses_mst": bool(model["uses_mst"]),
         "uses_labeler": bool(model["uses_labeler"]),
+        "uses_second_order": bool(model["uses_second_order"]),
     }
     with open(BEST_SETTINGS, "w", encoding="utf-8") as settings_file:
         json.dump(settings, settings_file, indent=1)
@@ -972,7 +1041,8 @@ def final_trees(outputs):
                 current_parsers.append(list(parser_settings))
             same_mst = saved["uses_mst"] == (outputs["mst"] is not None and outputs["mst"][0] is not None)
             same_labeler = saved["uses_labeler"] == (outputs["tree_labeler"] is not None)
-            if saved["parsers"] != current_parsers or not same_mst or not same_labeler:
+            same_so = saved.get("uses_second_order") == (outputs.get("second_order") is not None)
+            if saved["parsers"] != current_parsers or not same_mst or not same_labeler or not same_so:
                 print("The check run used different parsers or options: cannot use the learned combiner.")
                 model = None
 
@@ -1029,6 +1099,11 @@ def check_mode(all_train):
 
     label_names = get_label_names(all_train)
     punct_forms = find_punct_forms(train_sentences)
+
+    print("Learning unsupervised Bigram Class-HMM word clusters from training words...")
+    word_clusters = build_word_clusters(train_sentences)
+    print("    clustered %d vocabulary entries (64 fine / 16 coarse)" % len(word_clusters))
+
     (
         train_tags,
         other_tags,
@@ -1036,7 +1111,7 @@ def check_mode(all_train):
         other_supertags,
         train_upos,
         other_upos,
-    ) = make_tags(train_sentences, [dev_sentences])
+    ) = make_tags(train_sentences, [dev_sentences], word_clusters=word_clusters)
     dev_tags = other_tags[0]
     dev_supertags = other_supertags[0]
     dev_upos = other_upos[0]
@@ -1046,11 +1121,11 @@ def check_mode(all_train):
         print("    supertag accuracy on check data: %.2f" % tag_accuracy(make_supertag_targets(dev_sentences), dev_supertags))
 
     tag_Target_ltr = make_tag_targets(train_sentences)
-    lexicon_ltr = build_lexicon(tag_Target_ltr)
+    lexicon_ltr = build_lexicon(tag_Target_ltr, word_clusters=word_clusters)
     flipped_tag_Target = [flip_sentence(s) for s in tag_Target_ltr]
     for k in range(len(flipped_tag_Target)):
         flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
-    lexicon_rtl = build_lexicon(flipped_tag_Target)
+    lexicon_rtl = build_lexicon(flipped_tag_Target, word_clusters=word_clusters)
 
     train_mst, other_mst = make_mst_guides(
         train_sentences,
@@ -1062,6 +1137,7 @@ def check_mode(all_train):
         [dev_supertags],
         [dev_upos],
         lexicon_ltr,
+        word_clusters=word_clusters,
     )
     dev_mst = other_mst[0]
     if USE_SECOND_PASS_TAGGER:
@@ -1070,9 +1146,23 @@ def check_mode(all_train):
         mst_dev_uas, _ = accuracy(dev_sentences, dev_mst_heads, dummy_labels)
         print("    2-seed global Graph-MST UAS on check data: %.2f" % mst_dev_uas)
 
+    second_order = None
     tree_labeler = None
+    tree_labeler_2 = None
     if USE_SECOND_PASS_TAGGER:
-        print("Training the full-tree 2nd/3rd-order labeler...")
+        print("Training the 2nd-order Grandparent/Sibling/Valency graph tree model...")
+        second_order = SecondOrderTreeModel(lexicon=lexicon_ltr)
+        second_order.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            train_upos,
+            epochs=SECOND_ORDER_EPOCHS,
+            seed=1,
+        )
+
+        print("Training the 2-seed full-tree 2nd/3rd-order labeler...")
         tree_labeler = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
         tree_labeler.train(
             train_sentences,
@@ -1082,6 +1172,16 @@ def check_mode(all_train):
             train_upos,
             epochs=TREE_LABELER_EPOCHS,
             seed=1,
+        )
+        tree_labeler_2 = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
+        tree_labeler_2.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            train_upos,
+            epochs=TREE_LABELER_EPOCHS,
+            seed=2,
         )
 
     predictions = []
@@ -1123,13 +1223,27 @@ def check_mode(all_train):
             mst_list=dev_mst,
             upos_list=dev_upos,
             tree_labeler=tree_labeler,
+            tree_labeler_2=tree_labeler_2,
+            second_order=second_order,
             punct_forms=punct_forms,
         )
         uas, las = accuracy(dev_sentences, voted_heads, voted_labels)
-        print("    Chu-Liu/Edmonds ensemble (%d parsers + MST, before rules): UAS %.2f  LAS %.2f" % (len(predictions), uas, las))
+        print("    Chu-Liu/Edmonds ensemble (%d parsers + MST + 2nd-order, before rules): UAS %.2f  LAS %.2f" % (len(predictions), uas, las))
 
-    outputs = make_outputs(train_sentences, dev_sentences, predictions, weights, dev_tags,
-                           dev_supertags, dev_upos, dev_mst, tree_labeler, punct_forms)
+    outputs = make_outputs(
+        train_sentences,
+        dev_sentences,
+        predictions,
+        weights,
+        dev_tags,
+        dev_supertags,
+        dev_upos,
+        dev_mst,
+        tree_labeler,
+        punct_forms,
+        tree_labeler_2=tree_labeler_2,
+        second_order=second_order,
+    )
     learn_best_settings(outputs)
 
 
@@ -1140,6 +1254,11 @@ def final_mode(train_sentences):
 
     label_names = get_label_names(train_sentences)
     punct_forms = find_punct_forms(train_sentences)
+
+    print("Learning unsupervised Bigram Class-HMM word clusters from training words...")
+    word_clusters = build_word_clusters(train_sentences)
+    print("    clustered %d vocabulary entries (64 fine / 16 coarse)" % len(word_clusters))
+
     (
         train_tags,
         other_tags,
@@ -1147,17 +1266,17 @@ def final_mode(train_sentences):
         other_supertags,
         train_upos,
         other_upos,
-    ) = make_tags(train_sentences, [test_sentences])
+    ) = make_tags(train_sentences, [test_sentences], word_clusters=word_clusters)
     test_tags = other_tags[0]
     test_supertags = other_supertags[0]
     test_upos = other_upos[0]
 
     tag_Target_ltr = make_tag_targets(train_sentences)
-    lexicon_ltr = build_lexicon(tag_Target_ltr)
+    lexicon_ltr = build_lexicon(tag_Target_ltr, word_clusters=word_clusters)
     flipped_tag_Target = [flip_sentence(s) for s in tag_Target_ltr]
     for k in range(len(flipped_tag_Target)):
         flipped_tag_Target[k]["labels"] = flip_tags(tag_Target_ltr[k]["labels"])
-    lexicon_rtl = build_lexicon(flipped_tag_Target)
+    lexicon_rtl = build_lexicon(flipped_tag_Target, word_clusters=word_clusters)
 
     train_mst, other_mst = make_mst_guides(
         train_sentences,
@@ -1169,12 +1288,27 @@ def final_mode(train_sentences):
         [test_supertags],
         [test_upos],
         lexicon_ltr,
+        word_clusters=word_clusters,
     )
     test_mst = other_mst[0]
 
+    second_order = None
     tree_labeler = None
+    tree_labeler_2 = None
     if USE_SECOND_PASS_TAGGER:
-        print("Training the full-tree 2nd/3rd-order labeler...")
+        print("Training the 2nd-order Grandparent/Sibling/Valency graph tree model...")
+        second_order = SecondOrderTreeModel(lexicon=lexicon_ltr)
+        second_order.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            train_upos,
+            epochs=SECOND_ORDER_EPOCHS,
+            seed=1,
+        )
+
+        print("Training the 2-seed full-tree 2nd/3rd-order labeler...")
         tree_labeler = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
         tree_labeler.train(
             train_sentences,
@@ -1184,6 +1318,16 @@ def final_mode(train_sentences):
             train_upos,
             epochs=TREE_LABELER_EPOCHS,
             seed=1,
+        )
+        tree_labeler_2 = FullTreeLabeler(label_names, lexicon=lexicon_ltr)
+        tree_labeler_2.train(
+            train_sentences,
+            train_tags,
+            train_supertags,
+            train_mst,
+            train_upos,
+            epochs=TREE_LABELER_EPOCHS,
+            seed=2,
         )
 
     test_predictions = []
@@ -1215,8 +1359,20 @@ def final_mode(train_sentences):
         weights.append(weight)
         gc.collect()
 
-    outputs = make_outputs(train_sentences, test_sentences, test_predictions, weights, test_tags,
-                           test_supertags, test_upos, test_mst, tree_labeler, punct_forms)
+    outputs = make_outputs(
+        train_sentences,
+        test_sentences,
+        test_predictions,
+        weights,
+        test_tags,
+        test_supertags,
+        test_upos,
+        test_mst,
+        tree_labeler,
+        punct_forms,
+        tree_labeler_2=tree_labeler_2,
+        second_order=second_order,
+    )
     test_heads, test_labels = final_trees(outputs)
     write_final_submission(test_sentences, test_heads, test_labels, train_sentences)
 

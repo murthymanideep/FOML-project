@@ -29,6 +29,7 @@ from data_utils import (
     is_punct_word,
     build_lexicon,
     lookup_word_priors,
+    lookup_word_clusters,
 )
 from perceptron import AveragedPerceptron
 
@@ -215,6 +216,8 @@ class SentenceContext:
         self.shapes = [word_shape(w) for w in raw_words]
         self.sigs = [word_signature(raw_words[i], i) for i in range(n + 1)]
         self.suf3 = [w[-3:] for w in self.words]
+        self.suf2 = [w[-2:] for w in self.words]
+        self.pref3 = [w[:3] for w in self.words]
         self.wt = [self.words[i] + "/" + tags[i] for i in range(n + 1)]
         self.wc = [self.words[i] + "/" + self.coarse_tags[i] for i in range(n + 1)]
         self.wu = [self.words[i] + "/" + self.upos[i] for i in range(n + 1)]
@@ -228,13 +231,21 @@ class SentenceContext:
                 lookup_word_priors(lexicon, raw_words[i], self.words[i], i)
                 for i in range(n + 1)
             ]
+            w_clus = [
+                lookup_word_clusters(lexicon, raw_words[i], self.words[i], i)
+                for i in range(n + 1)
+            ]
             self.dom_tags = [p[0] for p in priors]
             self.amb_tags = [p[1] for p in priors]
             self.clusters = [p[3] for p in priors]
+            self.fine_clu = [c[0] for c in w_clus]
+            self.coarse_clu = [c[1] for c in w_clus]
         else:
             self.dom_tags = ["<NONE>"] * (n + 1)
             self.amb_tags = ["<NONE>"] * (n + 1)
             self.clusters = ["<NONE>"] * (n + 1)
+            self.fine_clu = ["FUNK"] * (n + 1)
+            self.coarse_clu = ["CUNK"] * (n + 1)
 
         if supertags is not None:
             self.supertags = supertags
@@ -370,12 +381,12 @@ class GraphMSTParser:
 
         rng = random.Random(2026)
         self.template_seeds = [
-            np.uint64(rng.getrandbits(64) | 1) for _ in range(42)
+            np.uint64(rng.getrandbits(64) | 1) for _ in range(48)
         ]
 
     def _extract_edge_feature_cube(self, ctx):
         """
-        Return a 3D uint64 array `F` of shape `(42, n + 1, n + 1)` containing
+        Return a 3D uint64 array `F` of shape `(48, n + 1, n + 1)` containing
         the hashed feature row indices for every directed edge (h -> m).
         """
         n = ctx.n
@@ -394,6 +405,8 @@ class GraphMSTParser:
         hdom = np.array([_h64("dom:" + ctx.dom_tags[i]) for i in range(size)], dtype=np.uint64)
         hsup = np.array([_h64("sup:" + ctx.supertags[i]) for i in range(size)], dtype=np.uint64)
         hdir = np.array([_h64("dir:" + ctx.dirs[i]) for i in range(size)], dtype=np.uint64)
+        hfc = np.array([_h64("fc:" + ctx.fine_clu[i]) for i in range(size)], dtype=np.uint64)
+        hcc = np.array([_h64("cc:" + ctx.coarse_clu[i]) for i in range(size)], dtype=np.uint64)
 
         ht_l1 = np.array(
             [_h64("tl1:" + (ctx.tags[i - 1] if i > 1 else "<S>")) for i in range(size)],
@@ -514,6 +527,14 @@ class GraphMSTParser:
             mix(ht, hu, btw_mat, 39),
             mix(hu ^ (hu_r1 * p3), hu ^ (hu_l1 * p3), dd_mat, 40),
             mix(hwu, hu, btw_mat, 41),
+
+            # Unsupervised Bigram Class-HMM word cluster global arc templates
+            mix(hfc, hfc, dir_mat, 42),
+            mix(hfc, hfc, dd_mat, 43),
+            mix(hcc, hcc, btw_mat, 44),
+            mix(hfc, ht, dd_mat, 45),
+            mix(ht, hfc, dd_mat, 46),
+            mix(hfc, hu, btw_mat, 47),
         ]
         return np.stack(templates, axis=0)
 
@@ -537,21 +558,30 @@ class GraphMSTParser:
         n = ctx.n
         scores, F = self.score_Create_matrix(ctx)
 
+        edge_margin = 4.0
         aug_scores = scores.copy()
         for m in range(1, n + 1):
             gh = gold_heads[m]
-            aug_scores[:, m] += 1.0
-            aug_scores[gh, m] -= 1.0
+            aug_scores[:, m] += edge_margin
+            aug_scores[gh, m] -= edge_margin
 
         pred_heads = chu_liu_edmonds(aug_scores)
-        for m in range(1, n + 1):
-            gh = gold_heads[m]
-            ph = pred_heads[m]
-            if ph != gh:
-                pos_rows = F[:, gh, m]
-                neg_rows = F[:, ph, m]
-                self._update_rows(pos_rows, +1.0)
-                self._update_rows(neg_rows, -1.0)
+        wrong = [m for m in range(1, n + 1) if pred_heads[m] != gold_heads[m]]
+        if wrong:
+            violation = 0.0
+            for m in wrong:
+                gh = gold_heads[m]
+                ph = pred_heads[m]
+                violation += edge_margin + float(scores[ph, m]) - float(scores[gh, m])
+            if violation > 0.0:
+                tau = violation / (2.0 * F.shape[0] * len(wrong))
+                if tau > 1.0:
+                    tau = 1.0
+                for m in wrong:
+                    gh = gold_heads[m]
+                    ph = pred_heads[m]
+                    self._update_rows(F[:, gh, m], +tau)
+                    self._update_rows(F[:, ph, m], -tau)
         self.step += 1
 
     def _update_rows(self, rows, delta):
@@ -635,7 +665,7 @@ class GraphMSTParser:
         }
 
 
-def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epochs=7, n_folds=5):
+def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epochs=7, n_folds=5, word_clusters=None):
     """
     Produce out-of-fold Global Graph MST predictions for training sentences
     so transition parsers can use them without overfitting.
@@ -662,7 +692,7 @@ def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epo
             {"words": train_sents[i]["words"], "labels": train_tags[i]}
             for i in range(len(train_sents))
         ]
-        fold_lexicon = build_lexicon(fold_tag_sents)
+        fold_lexicon = build_lexicon(fold_tag_sents, word_clusters=word_clusters)
         model = GraphMSTParser(lexicon=fold_lexicon)
         model.train(
             train_sents,
@@ -885,6 +915,8 @@ def _extract_shared_features(ctx, state):
     dom_tags = ctx.dom_tags
     amb_tags = ctx.amb_tags
     clusters = ctx.clusters
+    fine_clu = ctx.fine_clu
+    coarse_clu = ctx.coarse_clu
     supertags = ctx.supertags
     super_offset = ctx.super_offset
     super_hcg = ctx.super_hcg
@@ -950,6 +982,8 @@ def _extract_shared_features(ctx, state):
     s0sig = "<NONE>" if s0 == NONE else sigs[s0]
     s0amb = "<NONE>" if s0 == NONE else amb_tags[s0]
     s0clu = "<NONE>" if s0 == NONE else clusters[s0]
+    s0fc = "<NONE>" if s0 == NONE else fine_clu[s0]
+    s0cc = "<NONE>" if s0 == NONE else coarse_clu[s0]
 
     s1w = w(s1)
     s1st = st(s1)
@@ -962,6 +996,8 @@ def _extract_shared_features(ctx, state):
     s1wu = "<NONE>" if s1 == NONE else wu_arr[s1]
     s1d = "<NONE>" if s1 == NONE else dirs[s1]
     s1amb = "<NONE>" if s1 == NONE else amb_tags[s1]
+    s1fc = "<NONE>" if s1 == NONE else fine_clu[s1]
+    s1cc = "<NONE>" if s1 == NONE else coarse_clu[s1]
 
     s2w = w(s2)
     s2t = t(s2)
@@ -982,11 +1018,14 @@ def _extract_shared_features(ctx, state):
     n0sig = "<NONE>" if n0 == NONE else sigs[n0]
     n0amb = "<NONE>" if n0 == NONE else amb_tags[n0]
     n0clu = "<NONE>" if n0 == NONE else clusters[n0]
+    n0fc = "<NONE>" if n0 == NONE else fine_clu[n0]
+    n0cc = "<NONE>" if n0 == NONE else coarse_clu[n0]
 
     n1w = w(n1)
     n1t = t(n1)
     n1cg = cg(n1)
     n1u = u(n1)
+    n1cc = "<NONE>" if n1 == NONE else coarse_clu[n1]
     n1wt = "<NONE>" if n1 == NONE else wt_arr[n1]
     n2w = w(n2)
     n2t = t(n2)
@@ -1294,6 +1333,25 @@ def _extract_shared_features(ctx, state):
         "look_root=" + root_ahead + "+" + s0t + "+" + n0t,
         "look_cl=" + s1t + "+" + s0t + "+" + next_cl_t + "+" + next_cl_dist,
         "look_np=" + s0t + "+" + n0t + "+" + np_end_t + "+" + np_end_dist,
+
+        # Unsupervised Bigram Class-HMM word cluster features (Koo et al. 2008)
+        "s0fc=" + s0fc, "s0cc=" + s0cc,
+        "s1fc=" + s1fc, "s1cc=" + s1cc,
+        "n0fc=" + n0fc, "n0cc=" + n0cc,
+        "s0fc+n0fc=" + s0fc + "+" + n0fc,
+        "s0cc+n0cc=" + s0cc + "+" + n0cc,
+        "s0fc+n0t=" + s0fc + "+" + n0t,
+        "s0t+n0fc=" + s0t + "+" + n0fc,
+        "s1fc+s0fc=" + s1fc + "+" + s0fc,
+        "s1cc+s0cc=" + s1cc + "+" + s0cc,
+        "s1fc+s0t=" + s1fc + "+" + s0t,
+        "s1t+s0fc=" + s1t + "+" + s0fc,
+        "s1cc+s0cc+n0cc=" + s1cc + "+" + s0cc + "+" + n0cc,
+        "s0cc+n0cc+n1cc=" + s0cc + "+" + n0cc + "+" + n1cc,
+        "s0fc+n0fc+d=" + s0fc + "+" + n0fc + "+" + distance,
+        "s1fc+s0fc+ds1=" + s1fc + "+" + s0fc + "+" + distance_s1,
+        "s1fc+s0_case=" + s1fc + "+" + s0_case + "+" + s0cc,
+        "n0fc+s0_case=" + n0fc + "+" + s0_case + "+" + s0cc,
     ]
 
     # Global Graph-Based MST Guide Features (Nivre & McDonald 2008)
@@ -1449,11 +1507,11 @@ class Parser:
 
             augmented = allowed.copy()
             non_gold_mask = gold <= (VERY_LOW * 0.5)
-            augmented[non_gold_mask] += 1.0
+            augmented[non_gold_mask] += 10.0
             predicted = int(augmented.argmax())
 
             if predicted != best_correct:
-                self.model.update(rows, best_correct, predicted)
+                self.model.update_pa(rows, best_correct, predicted, scores, margin=10.0, cap=1.0)
 
             model_choice = int(allowed.argmax())
             if rng is not None and rng.random() > explore_prob:
@@ -1785,11 +1843,11 @@ class ArcEagerParser:
 
             augmented = allowed.copy()
             non_gold_mask = gold <= (VERY_LOW * 0.5)
-            augmented[non_gold_mask] += 1.0
+            augmented[non_gold_mask] += 10.0
             predicted = int(augmented.argmax())
 
             if predicted != best_correct:
-                self.model.update(rows, best_correct, predicted)
+                self.model.update_pa(rows, best_correct, predicted, scores, margin=10.0, cap=1.0)
 
             model_choice = int(allowed.argmax())
             if rng is not None and rng.random() > explore_prob:
@@ -2044,11 +2102,11 @@ class ArcStandardParser(Parser):
 
             augmented = allowed.copy()
             non_gold_mask = gold <= (VERY_LOW * 0.5)
-            augmented[non_gold_mask] += 1.0
+            augmented[non_gold_mask] += 10.0
             predicted = int(augmented.argmax())
 
             if predicted != best_correct:
-                self.model.update(rows, best_correct, predicted)
+                self.model.update_pa(rows, best_correct, predicted, scores, margin=10.0, cap=1.0)
 
             model_choice = int(allowed.argmax())
             if rng is not None and rng.random() > explore_prob:
@@ -2061,7 +2119,477 @@ class ArcStandardParser(Parser):
 
 
 # =====================================================================
-# 6. Full-Tree Second/Third-Order Dependency Label Classifier
+# 6. Second-Order Graph Tree Scorer (Grandparent + Sibling + Valency + Crossing)
+# =====================================================================
+
+def _is_ancestor(heads, u, v):
+    """Return True if node u is an ancestor of node v in tree `heads`."""
+    curr = v
+    while curr > 0:
+        if curr == u:
+            return True
+        curr = heads[curr]
+    return False
+
+
+def _count_crossings_of_edge(heads, n, h, m):
+    """Count edges (hx, x) in `heads` (x != m) that strictly cross (h, m)."""
+    if h <= 0 or m <= 0:
+        return 0
+    lo = h if h < m else m
+    hi = m if h < m else h
+    cnt = 0
+    for x in range(1, n + 1):
+        if x == m:
+            continue
+        hx = heads[x]
+        if hx <= 0:
+            continue
+        xlo = hx if hx < x else x
+        xhi = x if hx < x else hx
+        if (xlo < lo < xhi < hi) or (lo < xlo < hi < xhi):
+            cnt += 1
+    return cnt
+
+
+def _total_crossing_pairs(heads, n):
+    """Total number of unordered crossing edge pairs in tree `heads`."""
+    total = 0
+    for m in range(1, n + 1):
+        total += _count_crossings_of_edge(heads, n, heads[m], m)
+    return total // 2
+
+
+class SecondOrderTreeModel:
+    """
+    Second-Order Graph-Based Structured Perceptron (McDonald & Pereira 2006)
+    scoring full dependency trees on:
+      - Grandparent triples (g -> h -> m)
+      - Consecutive sibling triples (h, s1, s2) on left and right sides
+      - Head valency (left & right child counts)
+      - Crossing-arc (non-projectivity) count
+    Trained with 1-best MIRA / PA-I and exact coordinate-ascent hill-climbing.
+    """
+
+    def __init__(self, lexicon=None, n_rows=2 ** 21):
+        self.lexicon = lexicon
+        self.n_rows = n_rows
+        self.mask = n_rows - 1
+        self.weights = np.zeros(n_rows, dtype=np.float32)
+        self.totals = np.zeros(n_rows, dtype=np.float64)
+        self.timestamps = np.zeros(n_rows, dtype=np.int32)
+        self.cross_weight = 0.0
+        self.cross_total = 0.0
+        self.cross_ts = 0
+        self.step = 0
+
+    def _hash_rows(self, features):
+        mask = self.mask
+        return np.fromiter((hash(f) & mask for f in features), dtype=np.int32, count=len(features))
+
+    def _score_feats(self, features):
+        if not features:
+            return 0.0
+        rows = self._hash_rows(features)
+        return float(self.weights[rows].sum())
+
+    def _gp_features(self, ctx, g, h, m):
+        mu = ctx.upos[m]
+        mt = ctx.tags[m]
+        mcg = ctx.coarse_tags[m]
+        mw = ctx.words[m]
+        mfc = ctx.fine_clu[m]
+        if h <= 0:
+            return [
+                "gp0_u=" + mu,
+                "gp0_t=" + mt,
+                "gp0_w=" + mw,
+                "gp0_fc=" + mfc,
+            ]
+        hu = ctx.upos[h]
+        ht = ctx.tags[h]
+        hcg = ctx.coarse_tags[h]
+        hw = ctx.words[h]
+        hfc = ctx.fine_clu[h]
+        gu = "<ROOT>" if g <= 0 else ctx.upos[g]
+        gt = "<ROOT>" if g <= 0 else ctx.tags[g]
+        gcg = "<ROOT>" if g <= 0 else ctx.coarse_tags[g]
+        gfc = "FROOT" if g <= 0 else ctx.fine_clu[g]
+        dr_gh = "R0" if g <= 0 else ("R" if h > g else "L")
+        dr_hm = "R" if m > h else "L"
+        d_hm = distance_text(h, m)
+        return [
+            "gp_u=" + gu + "+" + hu + "+" + mu + "+" + dr_gh + "+" + dr_hm,
+            "gp_t=" + gt + "+" + ht + "+" + mt + "+" + dr_gh + "+" + dr_hm,
+            "gp_cg=" + gcg + "+" + hcg + "+" + mcg + "+" + dr_gh + "+" + dr_hm,
+            "gp_ud=" + gu + "+" + hu + "+" + mu + "+" + dr_hm + "+" + d_hm,
+            "gp_hw=" + gu + "+" + hw + "+" + mu + "+" + dr_gh + "+" + dr_hm,
+            "gp_mw=" + gu + "+" + hu + "+" + mw + "+" + dr_gh + "+" + dr_hm,
+            "gp_fc=" + gfc + "+" + hfc + "+" + mfc + "+" + dr_gh + "+" + dr_hm,
+        ]
+
+    def _head_children_features(self, ctx, h, child_list):
+        if h <= 0:
+            hu = ht = hcg = hw = hfc = hcc = "<ROOT>"
+        else:
+            hu = ctx.upos[h]
+            ht = ctx.tags[h]
+            hcg = ctx.coarse_tags[h]
+            hw = ctx.words[h]
+            hfc = ctx.fine_clu[h]
+            hcc = ctx.coarse_clu[h]
+
+        left_c = [c for c in child_list if c < h]
+        right_c = [c for c in child_list if c > h]
+        nl = str(min(len(left_c), 4))
+        nr = str(min(len(right_c), 4))
+
+        feats = [
+            "val_u=" + hu + "+" + nl + "+" + nr,
+            "val_t=" + ht + "+" + nl + "+" + nr,
+            "val_w=" + hw + "+" + nl + "+" + nr,
+            "val_fc=" + hfc + "+" + nl + "+" + nr,
+        ]
+
+        # Traverse children outward from h on both sides
+        for side, seq in (("L", left_c[::-1]), ("R", right_c)):
+            prev_c = -1
+            for curr_c in seq:
+                if prev_c < 0:
+                    u1 = t1 = cg1 = cc1 = "<FIRST>"
+                    d12 = "0"
+                else:
+                    u1 = ctx.upos[prev_c]
+                    t1 = ctx.tags[prev_c]
+                    cg1 = ctx.coarse_tags[prev_c]
+                    cc1 = ctx.coarse_clu[prev_c]
+                    d12 = distance_text(prev_c, curr_c)
+                u2 = ctx.upos[curr_c]
+                t2 = ctx.tags[curr_c]
+                cg2 = ctx.coarse_tags[curr_c]
+                cc2 = ctx.coarse_clu[curr_c]
+                feats.append("sib_u=" + hu + "+" + u1 + "+" + u2 + "+" + side)
+                feats.append("sib_t=" + ht + "+" + t1 + "+" + t2 + "+" + side)
+                feats.append("sib_cg=" + hcg + "+" + cg1 + "+" + cg2 + "+" + side)
+                feats.append("sib_w=" + hw + "+" + u1 + "+" + u2 + "+" + side)
+                feats.append("sib_cc=" + hcc + "+" + cc1 + "+" + cc2 + "+" + side)
+                feats.append("sib_d=" + hu + "+" + cg1 + "+" + cg2 + "+" + d12 + "+" + side)
+                prev_c = curr_c
+        return feats
+
+    def tree_features(self, ctx, heads):
+        n = ctx.n
+        children = [[] for _ in range(n + 1)]
+        for m in range(1, n + 1):
+            h = heads[m]
+            if 0 <= h <= n:
+                children[h].append(m)
+        feats = []
+        for m in range(1, n + 1):
+            h = heads[m]
+            g = heads[h] if 1 <= h <= n else -1
+            feats.extend(self._gp_features(ctx, g, h, m))
+        for h in range(0, n + 1):
+            feats.extend(self._head_children_features(ctx, h, children[h]))
+        return feats
+
+    def score_tree(self, ctx, heads):
+        feats = self.tree_features(ctx, heads)
+        cross = _total_crossing_pairs(heads, ctx.n)
+        return self._score_feats(feats) + self.cross_weight * cross
+
+    def edge_swap_delta(self, ctx, heads, children, m, h_new):
+        """
+        Exact score difference `score_tree(new) - score_tree(old)` when changing
+        only `heads[m]` from `h_old` to `h_new` (both > 0, no cycle).
+        """
+        h_old = heads[m]
+        if h_old == h_new:
+            return 0.0
+        g_old = heads[h_old] if h_old > 0 else -1
+        g_new = heads[h_new] if h_new > 0 else -1
+
+        old_feats = self._gp_features(ctx, g_old, h_old, m)
+        new_feats = self._gp_features(ctx, g_new, h_new, m)
+        for c in children[m]:
+            old_feats.extend(self._gp_features(ctx, h_old, m, c))
+            new_feats.extend(self._gp_features(ctx, h_new, m, c))
+
+        old_ch_old = children[h_old]
+        new_ch_old = [x for x in old_ch_old if x != m]
+        old_ch_new = children[h_new]
+        new_ch_new = sorted(old_ch_new + [m])
+
+        old_feats.extend(self._head_children_features(ctx, h_old, old_ch_old))
+        old_feats.extend(self._head_children_features(ctx, h_new, old_ch_new))
+        new_feats.extend(self._head_children_features(ctx, h_old, new_ch_old))
+        new_feats.extend(self._head_children_features(ctx, h_new, new_ch_new))
+
+        delta = self._score_feats(new_feats) - self._score_feats(old_feats)
+        cross_delta = (
+            _count_crossings_of_edge(heads, ctx.n, h_new, m)
+            - _count_crossings_of_edge(heads, ctx.n, h_old, m)
+        )
+        return delta + self.cross_weight * cross_delta
+
+    def decode_hill_climb(
+        self,
+        ctx,
+        base_scores,
+        cands_per_tok,
+        init_heads=None,
+        alpha=1.0,
+        gold_heads=None,
+        margin=0.0,
+        n_passes=2,
+    ):
+        """
+        Exact coordinate-ascent tree refinement starting from `init_heads`
+        (or Chu-Liu/Edmonds on `base_scores`). Preserves single-root tree invariant.
+        """
+        n = ctx.n
+        if n <= 1:
+            return [-1] if n <= 0 else [-1, 0]
+
+        if init_heads is None:
+            heads = list(chu_liu_edmonds(base_scores))
+        else:
+            heads = list(init_heads)
+
+        children = [[] for _ in range(n + 1)]
+        for m in range(1, n + 1):
+            h = heads[m]
+            if 0 <= h <= n:
+                children[h].append(m)
+
+        for _ in range(n_passes):
+            changed = False
+            for m in range(1, n + 1):
+                h_old = heads[m]
+                cands = cands_per_tok[m]
+                if not cands or len(cands) <= 1:
+                    continue
+                if h_old == 0:
+                    continue
+
+                base_old = float(base_scores[h_old, m])
+                if gold_heads is not None and h_old != gold_heads[m]:
+                    base_old += margin
+
+                best_h = h_old
+                best_gain = 1.0e-9
+                for h_new in cands:
+                    if h_new == h_old or h_new == m or h_new <= 0 or h_new > n:
+                        continue
+                    if _is_ancestor(heads, m, h_new):
+                        continue
+                    base_new = float(base_scores[h_new, m])
+                    if gold_heads is not None and h_new != gold_heads[m]:
+                        base_new += margin
+                    so_delta = self.edge_swap_delta(ctx, heads, children, m, h_new)
+                    gain = (base_new - base_old) + alpha * so_delta
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_h = h_new
+
+                if best_h != h_old:
+                    children[h_old].remove(m)
+                    children[best_h].append(m)
+                    children[best_h].sort()
+                    heads[m] = best_h
+                    changed = True
+
+            # Also check valid root swaps: swap current root r with any candidate m having 0 in cands[m]
+            curr_root = -1
+            for m in range(1, n + 1):
+                if heads[m] == 0:
+                    curr_root = m
+                    break
+            if curr_root > 0:
+                curr_so = self.score_tree(ctx, heads)
+                best_swap = None
+                best_gain = 1.0e-9
+                for m in range(1, n + 1):
+                    if m == curr_root or 0 not in cands_per_tok[m]:
+                        continue
+                    if heads[m] != curr_root:
+                        continue
+                    # Swapping root r <-> child m (heads[m]=0, heads[r]=m) is always a valid tree
+                    new_heads = list(heads)
+                    new_heads[m] = 0
+                    new_heads[curr_root] = m
+                    b_old = float(base_scores[0, curr_root]) + float(base_scores[curr_root, m])
+                    b_new = float(base_scores[0, m]) + float(base_scores[m, curr_root])
+                    if gold_heads is not None:
+                        if gold_heads[curr_root] != 0:
+                            b_old += margin
+                        if gold_heads[m] != curr_root:
+                            b_old += margin
+                        if gold_heads[m] != 0:
+                            b_new += margin
+                        if gold_heads[curr_root] != m:
+                            b_new += margin
+                    gain = (b_new - b_old) + alpha * (self.score_tree(ctx, new_heads) - curr_so)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_swap = (m, new_heads)
+                if best_swap is not None:
+                    heads = best_swap[1]
+                    children = [[] for _ in range(n + 1)]
+                    for m in range(1, n + 1):
+                        children[heads[m]].append(m)
+                    changed = True
+
+            if not changed:
+                break
+        return heads
+
+    def candidate_deltas_for_tree(self, words, tags, supertags, upos, init_heads, cands_per_tok):
+        """
+        Return a dict `(m, h) -> local_2nd_order_delta` relative to `init_heads`
+        for every candidate head h of word m. Used as a structural meta-feature
+        in the learned combiner.
+        """
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, upos=upos)
+        n = ctx.n
+        children = [[] for _ in range(n + 1)]
+        curr_root = -1
+        for m in range(1, n + 1):
+            h = init_heads[m]
+            if 0 <= h <= n:
+                children[h].append(m)
+            if h == 0:
+                curr_root = m
+
+        base_so = None
+        deltas = {}
+        for m in range(1, n + 1):
+            h_old = init_heads[m]
+            for h_new in cands_per_tok[m]:
+                if h_new == h_old:
+                    deltas[(m, h_new)] = 0.0
+                elif h_old == 0 or h_new == 0:
+                    if h_new == 0 and curr_root > 0 and init_heads[m] == curr_root:
+                        if base_so is None:
+                            base_so = self.score_tree(ctx, init_heads)
+                        nh = list(init_heads)
+                        nh[m] = 0
+                        nh[curr_root] = m
+                        deltas[(m, h_new)] = self.score_tree(ctx, nh) - base_so
+                    else:
+                        deltas[(m, h_new)] = 0.0
+                elif _is_ancestor(init_heads, m, h_new):
+                    deltas[(m, h_new)] = -2.0
+                else:
+                    deltas[(m, h_new)] = self.edge_swap_delta(ctx, init_heads, children, m, h_new)
+        return deltas
+
+    def refine_tree(self, words, tags, supertags, upos, base_scores, cands_per_tok, init_heads=None, alpha=0.25, n_passes=2):
+        ctx = SentenceContext(words, tags, supertags, self.lexicon, upos=upos)
+        return self.decode_hill_climb(
+            ctx, base_scores, cands_per_tok, init_heads=init_heads, alpha=alpha, n_passes=n_passes
+        )
+
+    def _update_rows(self, rows, delta):
+        elapsed = self.step - self.timestamps[rows]
+        self.totals[rows] += elapsed * self.weights[rows]
+        self.weights[rows] += np.float32(delta)
+        self.timestamps[rows] = self.step
+
+    def _update_cross(self, delta):
+        elapsed = self.step - self.cross_ts
+        self.cross_total += elapsed * self.cross_weight
+        self.cross_weight += float(delta)
+        self.cross_ts = self.step
+
+    def average_weights(self):
+        elapsed = self.step - self.timestamps
+        self.totals += elapsed * self.weights
+        self.cross_total += (self.step - self.cross_ts) * self.cross_weight
+        if self.step > 0:
+            self.weights = (self.totals / self.step).astype(np.float32)
+            self.cross_weight = self.cross_total / self.step
+
+    def train(self, sentences, tags_list, supertags_list=None, mst_list=None, upos_list=None, epochs=5, seed=1):
+        rng = random.Random(seed)
+        order = list(range(len(sentences)))
+        edge_margin = 2.0
+
+        for _ in range(epochs):
+            rng.shuffle(order)
+            for k in order:
+                s = sentences[k]
+                words = s["words"]
+                gold_heads = s["heads"]
+                n = len(words) - 1
+                if n <= 1:
+                    continue
+                tags = tags_list[k]
+                stags = supertags_list[k] if supertags_list is not None else None
+                utags = upos_list[k] if upos_list is not None else None
+                ctx = SentenceContext(words, tags, stags, self.lexicon, upos=utags)
+
+                # Candidate heads per token: MST top-3 + gold head + immediate neighbors
+                base_scores = np.full((n + 1, n + 1), -1.0e4, dtype=np.float64)
+                cands_per_tok = [[] for _ in range(n + 1)]
+                minfo = mst_list[k] if mst_list is not None else None
+                for m in range(1, n + 1):
+                    c_list = []
+                    if minfo is not None:
+                        for key, sc in (("heads", 2.0), ("heads2", 0.5), ("heads3", 0.0)):
+                            if key in minfo:
+                                h = minfo[key][m]
+                                if 0 <= h <= n and h != m:
+                                    if h not in c_list:
+                                        c_list.append(h)
+                                    if sc > base_scores[h, m]:
+                                        base_scores[h, m] = sc
+                    gh = gold_heads[m]
+                    if gh not in c_list:
+                        c_list.append(gh)
+                    if base_scores[gh, m] < -1.0e3:
+                        base_scores[gh, m] = 0.0
+                    cands_per_tok[m] = c_list
+
+                init_heads = minfo["heads"] if minfo is not None else gold_heads
+                pred_heads = self.decode_hill_climb(
+                    ctx,
+                    base_scores,
+                    cands_per_tok,
+                    init_heads=init_heads,
+                    alpha=1.0,
+                    gold_heads=gold_heads,
+                    margin=edge_margin,
+                    n_passes=2,
+                )
+
+                n_err = sum(1 for m in range(1, n + 1) if pred_heads[m] != gold_heads[m])
+                if n_err > 0:
+                    g_feats = self.tree_features(ctx, gold_heads)
+                    p_feats = self.tree_features(ctx, pred_heads)
+                    g_rows = self._hash_rows(g_feats)
+                    p_rows = self._hash_rows(p_feats)
+                    g_cross = _total_crossing_pairs(gold_heads, n)
+                    p_cross = _total_crossing_pairs(pred_heads, n)
+
+                    g_sc = float(self.weights[g_rows].sum()) + self.cross_weight * g_cross
+                    p_sc = float(self.weights[p_rows].sum()) + self.cross_weight * p_cross
+                    violation = edge_margin * n_err - (g_sc - p_sc)
+                    if violation > 0.0:
+                        denom = float(len(g_rows) + len(p_rows) + (g_cross - p_cross) ** 2)
+                        tau = violation / max(denom, 1.0)
+                        if tau > 0.5:
+                            tau = 0.5
+                        self._update_rows(g_rows, +tau)
+                        self._update_rows(p_rows, -tau)
+                        if g_cross != p_cross:
+                            self._update_cross(tau * (g_cross - p_cross))
+                self.step += 1
+        self.average_weights()
+
+
+# =====================================================================
+# 7. Full-Tree Second/Third-Order Dependency Label Classifier
 # =====================================================================
 
 class FullTreeLabeler:
@@ -2174,6 +2702,8 @@ class FullTreeLabeler:
         mdom = ctx.dom_tags[m]
         mamb = ctx.amb_tags[m]
         msup = ctx.supertags[m]
+        mfc = ctx.fine_clu[m]
+        mcc = ctx.coarse_clu[m]
 
         hw = ctx.words[h]
         hst = ctx.stems[h]
@@ -2182,6 +2712,8 @@ class FullTreeLabeler:
         hcg = ctx.coarse_tags[h]
         hu = ctx.upos[h]
         hsig = ctx.sigs[h]
+        hfc = ctx.fine_clu[h]
+        hcc = ctx.coarse_clu[h]
 
         gt = "<ROOT>" if g <= 0 else ctx.tags[g]
         gcg = "<ROOT>" if g <= 0 else ctx.coarse_tags[g]
@@ -2217,6 +2749,11 @@ class FullTreeLabeler:
         mu_l1 = ctx.upos[m - 1] if m > 1 else "<S>"
         mu_r1 = ctx.upos[m + 1] if m < ctx.n else "<E>"
 
+        m_nch = str(min(len(children[m]), 4))
+        h_nch = str(min(len(children[h]), 5))
+        m_punct_l = mw_l1 if mw_l1 in (",", ":", ";", "(", ")", '"', "--", "-") else "NO"
+        m_punct_r = mw_r1 if mw_r1 in (",", ":", ";", "(", ")", '"', "--", "-") else "NO"
+
         return [
             "bias",
             "mt=" + mt,
@@ -2230,6 +2767,11 @@ class FullTreeLabeler:
             "mdom=" + mdom,
             "mamb=" + mamb,
             "msup=" + msup,
+            "mfc+dr=" + mfc + "+" + dr,
+            "mfc+hfc+dr=" + mfc + "+" + hfc + "+" + dr,
+            "mcc+hcc+dr=" + mcc + "+" + hcc + "+" + dr,
+            "mfc+hu+dr=" + mfc + "+" + hu + "+" + dr,
+            "mu+hfc+dr=" + mu + "+" + hfc + "+" + dr,
             "mt+ht+dr=" + mt + "+" + ht + "+" + dr,
             "mu+hu+dr=" + mu + "+" + hu + "+" + dr,
             "mu+hu+dist=" + mu + "+" + hu + "+" + dr + "+" + dist,
@@ -2273,6 +2815,10 @@ class FullTreeLabeler:
             "upos_neigh=" + mu_l1 + "+" + mu + "+" + mu_r1 + "+" + hu + "+" + dr,
             "mw_neigh=" + mw_l1 + "+" + mw + "+" + mw_r1 + "+" + dr,
 
+            # Punctuation enclosure & valency (appos vs parataxis vs conj vs advcl)
+            "punct_enc=" + m_punct_l + "+" + m_punct_r + "+" + mu + "+" + hu + "+" + dr,
+            "val_lbl=" + m_nch + "+" + h_nch + "+" + mu + "+" + hu + "+" + dr,
+
             # Children & sibling structure
             "m_ch_cgs=" + child_cg_sig[m] + "+" + mu + "+" + hu,
             "h_ch_cgs=" + child_cg_sig[h] + "+" + mu + "+" + dr,
@@ -2292,11 +2838,12 @@ class FullTreeLabeler:
         supertags_list=None,
         mst_list=None,
         upos_list=None,
-        epochs=5,
+        epochs=6,
         seed=1,
     ):
         rng = random.Random(seed)
         order = list(range(len(sentences)))
+        lbl_margin = 6.0
         for epoch in range(epochs):
             rng.shuffle(order)
             for k in order:
@@ -2320,20 +2867,21 @@ class FullTreeLabeler:
                     scores, rows = self.score_node(tree_ctx, heads, m, use_average=False)
                     correct = self.label_number[gold_labels[m]]
                     augmented = scores.copy()
-                    augmented += 0.5
-                    augmented[correct] -= 0.5
+                    augmented += lbl_margin
+                    augmented[correct] -= lbl_margin
                     if "root" in self.label_number:
                         augmented[self.label_number["root"]] = VERY_LOW
                     guess = int(augmented.argmax())
                     if guess != correct:
-                        self.model.update(rows, correct, guess)
+                        self.model.update_pa(rows, correct, guess, scores, margin=lbl_margin, cap=0.5)
                 self.model.next_step()
         self.model.average_weights()
 
-    def score_sentence_labels(self, words, tags, supertags, heads, upos=None):
+    def score_sentence_labels(self, words, tags, supertags, heads, upos=None, second_model=None):
         """
         Return a list of length n + 1 where entry `m` (for m >= 1) is a dict
-        mapping `label_name -> score` from the full-tree labeler.
+        mapping `label_name -> score` from the full-tree labeler (optionally
+        averaged with `second_model`).
         """
         tree_ctx = self._prepare_tree_context(words, tags, supertags, heads, upos)
         n = len(words) - 1
@@ -2343,6 +2891,9 @@ class FullTreeLabeler:
                 out[m] = {"root": 10.0}
                 continue
             scores, _ = self.score_node(tree_ctx, heads, m, use_average=True)
+            if second_model is not None:
+                scores2, _ = second_model.score_node(tree_ctx, heads, m, use_average=True)
+                scores = 0.5 * (scores + scores2)
             out[m] = {
                 self.label_names[idx]: float(scores[idx])
                 for idx in range(len(self.label_names))
