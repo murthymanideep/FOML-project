@@ -1,19 +1,9 @@
 """
-Sequence taggers for predicting each word's:
-  0. Intrinsic Syntactic Word Class (`upos`, 17 UD-derived POS categories induced
-     strictly from the gold dependency trees in `train.csv`)
-  1. Fine-grained relation + attachment direction (`tag`, e.g. "nsubj>", "obl<", "root")
-  2. Relative head-offset + head coarse category (`supertag`, e.g. "+1:OBJ", "-2:CLAUSE", "ROOT:ROOT")
-
-Uses:
-  - Unsupervised Bigram Class-HMM word clusters (64 fine + 16 coarse) learned
-    strictly from training word sequences.
-  - Fold-specific empirical word/stem/signature priors (`build_lexicon`)
-    computed strictly inside each jackknife training fold to prevent leakage.
-  - Induced POS (`upos`) sequence tagging followed by Bidirectional Pass-1/Pass-2
-    dependency tagging and global sentence-level clause/verb/root/nominal lookahead.
-  - Beam Search Structured Perceptron (Collins 2002; Collins & Roark 2004) with
-    Early-Update and Passive-Aggressive (PA-I) sequence-level margin scaling.
+Sequence taggers using beam search (width 4) and an averaged structured
+perceptron with early updates:
+  - UPOS tagger (word classes induced from training trees)
+  - Directional syntactic role tagger (e.g. "nsubj>", "obl<", "root")
+  - Relative head-offset supertagger (e.g. "+1:OBJ", "-2:CLAUSE")
 """
 
 import random
@@ -28,7 +18,6 @@ from data_utils import (
     coarse_group,
     tag_direction,
     head_offset_bucket,
-    is_punct_word,
     find_punct_forms,
     find_standalone_nominals,
     find_possessive_markers,
@@ -1062,5 +1051,5 @@ def jackknife_tags(
                 backward_tags=bwd_tags,
                 upos_tags=utags,
             )
-        print("    jackknife fold", fold + 1, "of", n_folds, "done")
+        print("  fold %d/%d done" % (fold + 1, n_folds))
     return all_tags

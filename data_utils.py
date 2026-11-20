@@ -609,22 +609,15 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
 
 
 def _xlogx(x):
-    """Compute x * log(x) safely with 0 * log(0) = 0."""
+    """Safe x * log(x) with 0 * log(0) = 0."""
     return np.where(x > 0.0, x * np.log(np.maximum(x, 1.0)), 0.0)
 
 
 def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=6):
     """
-    Unsupervised Class-Based Bigram HMM Word Clustering (Martin, Liermann & Ney 1998
-    Exchange Algorithm — fast Brown-style distributional clustering).
-
-    Uses ONLY raw word sequences from the training sentences (zero labels, zero
-    external data, zero neural networks). Rare words (count < min_count) are mapped
-    to their morphological signature so even OOV words get clustered by context.
-    Then hierarchically merges the `n_fine` clusters down to `n_coarse` clusters
-    by minimum bigram mutual-information loss.
-
-    Returns a dictionary mapping token/signature key -> (fine_id, coarse_id).
+    Group words into n_fine and n_coarse distributional clusters using bigram
+    exchange clustering on the training words only. Rare words fall back to
+    their word signature so unseen words still get a cluster.
     """
     raw_counts = {}
     for s in sentences:
@@ -633,7 +626,6 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
             nw = normalize_word(words[i])
             raw_counts[nw] = raw_counts.get(nw, 0) + 1
 
-    # Map every token in training sentences to its vocabulary key (word or <SIG>:sig)
     vocab_counts = {}
     corpus_seqs = []
     for s in sentences:
@@ -650,7 +642,6 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
         if seq:
             corpus_seqs.append(seq)
 
-    # Sort vocabulary deterministically by (-count, key)
     vocab_keys = sorted(vocab_counts.keys(), key=lambda k: (-vocab_counts[k], k))
     n_vocab = len(vocab_keys)
     if n_vocab <= 2:
@@ -683,23 +674,18 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
             prev = curr
         out_edges[prev][EOS_ID] = out_edges[prev].get(EOS_ID, 0.0) + 1.0
 
-    # Initialize classes: top C-1 most frequent words in their own classes, rest balanced
+    # Put the most frequent words in their own classes, spread the rest evenly
     word_class = np.zeros(n_vocab + 2, dtype=np.int32)
     word_class[BOS_ID] = BOS_CLASS
     word_class[EOS_ID] = EOS_CLASS
     for w in range(n_vocab):
-        if w < C - 1:
-            word_class[w] = w
-        else:
-            word_class[w] = w % C
+        word_class[w] = w if w < C - 1 else w % C
 
-    # Convert neighbor dicts to compact numpy arrays for fast exchange iterations
     out_nbrs = [np.fromiter(d.keys(), dtype=np.int32, count=len(d)) for d in out_edges]
     out_cnts = [np.fromiter(d.values(), dtype=np.float64, count=len(d)) for d in out_edges]
     in_nbrs = [np.fromiter(d.keys(), dtype=np.int32, count=len(d)) for d in in_edges]
     in_cnts = [np.fromiter(d.values(), dtype=np.float64, count=len(d)) for d in in_edges]
 
-    # Build initial class counts and (C+2) x (C+2) class bigram matrix
     cnt = np.zeros(N_TOT, dtype=np.float64)
     B = np.zeros((N_TOT, N_TOT), dtype=np.float64)
     cnt[BOS_CLASS] = float(len(corpus_seqs))
@@ -711,13 +697,12 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
             B[cw, cw] += self_loops[w]
         if len(out_nbrs[w]) > 0:
             np.add.at(B[cw], word_class[out_nbrs[w]], out_cnts[w])
-    # Also add BOS -> first_word transitions into B[BOS_CLASS, :]
     for w in range(n_vocab):
         bos_c = in_edges[w].get(BOS_ID, 0.0)
         if bos_c > 0.0:
             B[BOS_CLASS, word_class[w]] += bos_c
 
-    # Exchange iterations maximizing exact Bigram Class-HMM log-likelihood
+    # Move each word to whichever class maximizes bigram log-likelihood
     for _ in range(n_iters):
         moved = 0
         for w in range(n_vocab):
@@ -732,13 +717,11 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
             if len(in_nbrs[w]) > 0:
                 np.add.at(in_c, word_class[in_nbrs[w]], in_cnts[w])
 
-            # Remove w from c_old
             cnt[c_old] -= nw
             B[c_old, :] -= out_c
             B[:, c_old] -= in_c
             B[c_old, c_old] -= sw
 
-            # Score inserting w into every candidate class 0..C-1 simultaneously
             cnt_cand = cnt[:C]
             delta = -2.0 * (_xlogx(cnt_cand + nw) - _xlogx(cnt_cand))
 
@@ -760,7 +743,6 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
             delta += _xlogx(diag_B + o_d + i_d + sw) - _xlogx(diag_B)
 
             c_best = int(np.argmax(delta))
-            # Insert w into c_best
             cnt[c_best] += nw
             B[c_best, :] += out_c
             B[:, c_best] += in_c
@@ -771,10 +753,8 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
         if moved == 0:
             break
 
-    # Hierarchical agglomerative merge from C fine clusters -> n_coarse coarse clusters
-    # by minimum exact bigram log-likelihood loss.
+    # Greedily merge fine clusters down to n_coarse clusters
     active = [c for c in range(C) if cnt[c] > 0.0]
-    parent_coarse = {c: c for c in range(C)}
     B_m = B.copy()
     cnt_m = cnt.copy()
     members = {c: [c] for c in active}
@@ -794,11 +774,9 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
                 row_b = B_m[b, :]
                 col_b = B_m[:, b]
                 cb = cnt_m[b]
-                # Exact change in L = sum xlogx(B) - 2 sum xlogx(cnt)
                 dL = -2.0 * (_xlogx(ca + cb) - _xlogx(ca) - _xlogx(cb))
                 dL += float((_xlogx(row_a + row_b) - _xlogx(row_a) - _xlogx(row_b)).sum())
                 dL += float((_xlogx(col_a + col_b) - _xlogx(col_a) - _xlogx(col_b)).sum())
-                # Fix 2x2 sub-block {a, b} x {a, b} double-counted in row + col sums
                 aa, ab, ba, bb = B_m[a, a], B_m[a, b], B_m[b, a], B_m[b, b]
                 dL -= float(_xlogx(aa + ba) - _xlogx(aa) - _xlogx(ba))
                 dL -= float(_xlogx(ab + bb) - _xlogx(ab) - _xlogx(bb))
@@ -824,25 +802,18 @@ def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=
         for orig_c in members[root_c]:
             coarse_map[orig_c] = new_cid
 
-    # Deterministic renumbering of fine classes by descending frequency
     fine_order = sorted(range(C), key=lambda c: (-cnt[c], c))
     fine_renum = {old_c: new_i for new_i, old_c in enumerate(fine_order)}
 
     clusters = {}
     for w, key in enumerate(vocab_keys):
         fc = int(word_class[w])
-        f_str = "F%02d" % fine_renum[fc]
-        c_str = "C%02d" % coarse_map.get(fc, 0)
-        clusters[key] = (f_str, c_str)
+        clusters[key] = ("F%02d" % fine_renum[fc], "C%02d" % coarse_map.get(fc, 0))
     return clusters
 
 
 def lookup_word_clusters(lexicon, raw_word, normal_word, position):
-    """
-    Return `(fine_cluster, coarse_cluster)` from the unsupervised bigram word
-    clusters stored in `lexicon`, falling back to `<SIG>:word_signature` for
-    rare/unseen words.
-    """
+    """Look up (fine_cluster, coarse_cluster) for a word, falling back to its signature."""
     if raw_word == ROOT_WORD:
         return ("FROOT", "CROOT")
     if lexicon is None:
@@ -853,8 +824,7 @@ def lookup_word_clusters(lexicon, raw_word, normal_word, position):
     res = wc.get(normal_word)
     if res is not None:
         return res
-    sig_key = "<SIG>:" + word_signature(raw_word, position)
-    res = wc.get(sig_key)
+    res = wc.get("<SIG>:" + word_signature(raw_word, position))
     if res is not None:
         return res
     return ("FUNK", "CUNK")

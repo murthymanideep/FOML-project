@@ -1,28 +1,10 @@
 """
-The learned combiner: Conditional Softmax (Multinomial) Logistic Regression
-(written with numpy only, trained with exact L2-regularized Newton's method).
+Learned ensemble combiner using conditional softmax logistic regression
+(L2-regularized Newton's method in numpy).
 
-The normal vote in train_and_predict.py adds up hand-set numbers (parser
-weights 1.35, 1.25, ..., MST bonuses 1.05 / 0.72 / 0.45, ...). The learned
-combiner learns these numbers from data instead:
-
-  1. HEADS. For every word, the candidate heads are all heads that any parser
-     or the MST parser proposed. Each candidate "head -> word" is described
-     by meta-features: per-parser votes & margins, 3-system family agreement
-     (Arc-Hybrid / Arc-Eager / Arc-Standard, L-to-R / R-to-L), MST top-3 &
-     confidence, relative vote/score gaps, distance/direction, tagger/supertagger
-     agreement, and the 2nd-order Grandparent/Sibling/Valency tree delta.
-     Conditional Softmax Logistic Regression learns calibrated P(h | word),
-     and Chu-Liu/Edmonds decodes the Maximum Likelihood single-root tree.
-
-  2. LABELS. For every word, the candidate labels are the labels proposed by
-     the parsers and the 3 best labels of the 2-seed full-tree labeler. A
-     second Conditional Softmax Logistic Regression learns P(label | word, head).
-
-It learns from the CHECK data at the end of "python train_and_predict.py
---check": those parser outputs come from models that never saw the check
-sentences, so they make realistic mistakes. Its weights are saved in
-best_settings.json, and the normal run uses them on the TEST data.
+Learns weights on the validation split for:
+  1. Candidate heads -> Chu-Liu/Edmonds tree decoding
+  2. Candidate dependency labels given the decoded tree
 """
 
 import math
@@ -635,47 +617,40 @@ def predict_labels(outputs, label_weights, k, heads):
 
 # ----------------------------- training and use -----------------------------
 
-def train_combiner(outputs, sentence_ids):
-    """Learn the head softmax model and the label softmax model from these check sentences."""
+def train_combiner(outputs, sentence_ids, l2=5.0):
+    """Fit head and label softmax models on the given validation sentences."""
     X_arc, y_arc, _, arc_groups = arc_table(outputs, sentence_ids)
-    arc_weights = train_softmax_regression(X_arc, y_arc, arc_groups, l2=5.0)
+    arc_weights = train_softmax_regression(X_arc, y_arc, arc_groups, l2=l2)
     X_lbl, y_lbl, lbl_groups = label_table(outputs, sentence_ids)
-    label_weights = train_softmax_regression(X_lbl, y_lbl, lbl_groups, l2=5.0)
-    model = {}
-    model["arc_weights"] = arc_weights
-    model["label_weights"] = label_weights
-    model["parsers"] = list(outputs["parsers"])
-    model["uses_mst"] = outputs["mst"] is not None and outputs["mst"][0] is not None
-    model["uses_labeler"] = outputs["tree_labeler"] is not None
-    model["uses_second_order"] = outputs.get("second_order") is not None
-    return model
+    label_weights = train_softmax_regression(X_lbl, y_lbl, lbl_groups, l2=l2)
+    return {
+        "arc_weights": arc_weights,
+        "label_weights": label_weights,
+        "parsers": list(outputs["parsers"]),
+        "uses_mst": outputs["mst"] is not None and outputs["mst"][0] is not None,
+        "uses_labeler": outputs["tree_labeler"] is not None,
+        "uses_second_order": outputs.get("second_order") is not None,
+    }
 
 
 def combine(outputs, model, sentence_ids=None):
-    """Heads and labels for the sentences, using a trained combiner."""
+    """Predict heads and labels using a trained combiner."""
     if sentence_ids is None:
         sentence_ids = list(range(len(outputs["sentences"])))
     heads_of = predict_heads(outputs, model["arc_weights"], sentence_ids)
-    labels_of = {}
-    for k in sentence_ids:
-        labels_of[k] = predict_labels(outputs, model["label_weights"], k, heads_of[k])
+    labels_of = {k: predict_labels(outputs, model["label_weights"], k, heads_of[k]) for k in sentence_ids}
     return heads_of, labels_of
 
 
-def cross_validate(outputs):
-    """
-    Honest score of the combiner on the check data: learn on one half of the
-    check sentences, predict the other half, and the other way round.
-    The check sentences come in groups of neighbouring sentences, so the two
-    halves mostly contain different documents.
-    """
+def cross_validate(outputs, l2=5.0):
+    """2-fold CV on the validation split (first half vs second half)."""
     n = len(outputs["sentences"])
     first_half = list(range(0, n // 2))
     second_half = list(range(n // 2, n))
     all_heads = [None] * n
     all_labels = [None] * n
     for (learn_ids, predict_ids) in [(first_half, second_half), (second_half, first_half)]:
-        model = train_combiner(outputs, learn_ids)
+        model = train_combiner(outputs, learn_ids, l2=l2)
         heads_of, labels_of = combine(outputs, model, predict_ids)
         for k in predict_ids:
             all_heads[k] = heads_of[k]

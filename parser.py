@@ -1,17 +1,10 @@
 """
-Hybrid Dependency Parsing Architecture (100% Non-Neural Linear Structured Perceptrons):
-  1. `chu_liu_edmonds`: Exact single-root Chu-Liu/Edmonds Maximum Spanning
-     Arborescence (MST) algorithm for global cycle-free tree decoding.
-  2. `GraphMSTParser`: Fast vectorized 42-template First-Order Graph-Based
-     Structured Perceptron trained with loss-augmented Chu-Liu/Edmonds decoding.
-  3. Three Complementary Transition-Based Parsing Systems (all Graph-Guided):
-     - `Parser` (`Arc-Hybrid`: bottom-up right, stack-buffer left)
-     - `ArcEagerParser` (`Arc-Eager`: top-down right with parent/label features)
-     - `ArcStandardParser` (`Arc-Standard`: stack-stack s1/s0 bottom-up left & right
-       with buffer lookahead n0)
-  4. `FullTreeLabeler`: Second/third-order full-tree structured perceptron
-     conditioned on Induced POS (`upos`), parent, grandparent, siblings, and
-     all functional children (`case`, `mark`, `cop`, `aux:pass`, `nsubj`, `obj`).
+Dependency parsers built on linear structured perceptrons:
+  - chu_liu_edmonds: single-root maximum spanning tree decoder
+  - GraphMSTParser: first-order graph parser (48 vectorized edge templates)
+  - Parser / ArcEagerParser / ArcStandardParser: three transition systems
+  - SecondOrderTreeModel: grandparent, sibling, valency, and crossing scorer
+  - FullTreeLabeler: full-tree dependency label classifier
 """
 
 import random
@@ -216,8 +209,6 @@ class SentenceContext:
         self.shapes = [word_shape(w) for w in raw_words]
         self.sigs = [word_signature(raw_words[i], i) for i in range(n + 1)]
         self.suf3 = [w[-3:] for w in self.words]
-        self.suf2 = [w[-2:] for w in self.words]
-        self.pref3 = [w[:3] for w in self.words]
         self.wt = [self.words[i] + "/" + tags[i] for i in range(n + 1)]
         self.wc = [self.words[i] + "/" + self.coarse_tags[i] for i in range(n + 1)]
         self.wu = [self.words[i] + "/" + self.upos[i] for i in range(n + 1)]
@@ -708,7 +699,7 @@ def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epo
             mst_infos[k] = model.predict_mst_info(
                 sentences[k]["words"], tags_list[k], stags, utags
             )
-        print("    MST jackknife fold", fold + 1, "of", n_folds, "done")
+        print("  MST fold %d/%d done" % (fold + 1, n_folds))
     return mst_infos
 
 
@@ -2902,18 +2893,7 @@ class FullTreeLabeler:
         return out
 
 
-# =====================================================================
-# 7. Helpers for Right-to-Left (Backward) Sentence & MST Flipping
-# =====================================================================
-
-def label_set(state, children):
-    labels = sorted(set(state.labels[c] for c in children))
-    return "+".join(labels)
-
-
-def normalize_all(words):
-    return [normalize_word(word) for word in words]
-
+# --- Helpers for right-to-left sentence flipping ---
 
 def flip_position(i, n):
     if i <= 0:
