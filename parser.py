@@ -2190,6 +2190,8 @@ class FullTreeLabeler:
         hcg = ctx.coarse_tags[h]
         hu = ctx.upos[h]
         hsig = ctx.sigs[h]
+        hdom = ctx.dom_tags[h]
+        hamb = ctx.amb_tags[h]
 
         gt = "<ROOT>" if g <= 0 else ctx.tags[g]
         gcg = "<ROOT>" if g <= 0 else ctx.coarse_tags[g]
@@ -2208,6 +2210,20 @@ class FullTreeLabeler:
         lsib_u = "<NONE>" if lsib < 0 else ctx.upos[lsib]
         lsib_w = "<NONE>" if lsib < 0 else ctx.words[lsib]
 
+        # Core-argument uniqueness on head h strictly excluding m itself
+        other_left_subj = any(
+            c != m and c < h and ctx.base_tags[c] in ("nsubj", "csubj")
+            for c in sibs
+        )
+        other_obj_left = any(
+            c != m and h < c < m and ctx.base_tags[c] in ("obj", "iobj")
+            for c in sibs
+        )
+        other_obj_right = any(
+            c != m and c > max(h, m) and ctx.base_tags[c] in ("obj", "iobj")
+            for c in sibs
+        )
+
         m_case = case_w[m]
         m_mark = mark_w[m]
         m_aux = aux_str[m]
@@ -2215,8 +2231,8 @@ class FullTreeLabeler:
         h_case = case_w[h]
         h_aux = aux_str[h]
 
-        h_is_pred = str(hu.startswith("VERB") or hcg == "CLAUSE" or ht == "root" or has_cop[h] or has_subj[h])
-        h_is_nom = str((hu in ("NOUN", "PROPN", "PRON", "NUM") or hcg in ("SUBJ", "OBJ", "NMOD", "COMP")) and not has_cop[h] and not has_subj[h])
+        h_is_pred = str(hu.startswith("VERB") or hcg == "CLAUSE" or ht == "root" or has_cop[h] or other_left_subj)
+        h_is_nom = str((hu in ("NOUN", "PROPN", "PRON", "NUM") or hcg in ("SUBJ", "OBJ", "NMOD", "COMP")) and not has_cop[h] and not other_left_subj)
         m_is_clause = str(mu.startswith("VERB") or mcg == "CLAUSE" or has_cop[m] or has_subj[m] or m_mark != "<NONE>")
 
         mw_l1 = ctx.words[m - 1] if m > 1 else "<S>"
@@ -2268,6 +2284,9 @@ class FullTreeLabeler:
             "mt+hst+dr=" + mt + "+" + hst + "+" + dr,
             "mamb+hcg+dr=" + mamb + "+" + hcg + "+" + dr,
             "mamb+hu+dr=" + mamb + "+" + hu + "+" + dr,
+            "mamb+hamb+dr=" + mamb + "+" + hamb + "+" + dr,
+            "mbt+hamb+dr=" + mbt + "+" + hamb + "+" + dr,
+            "mu+hdom+dr=" + mu + "+" + hdom + "+" + dr,
             "mt+ht+gt=" + mt + "+" + ht + "+" + gt,
             "mu+hu+gu=" + mu + "+" + hu + "+" + gu,
             "mcg+hcg+gcg=" + mcg + "+" + hcg + "+" + gcg,
@@ -2280,14 +2299,15 @@ class FullTreeLabeler:
 
             # Full-tree clausal (ccomp vs xcomp vs advcl vs acl vs acl:relcl) disambiguation
             "cl_full=" + m_is_clause + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hu + "+" + hcg + "+" + dr,
-            "cl_lex=" + hst + "+" + m_mark + "+" + str(has_subj[m]) + "+" + str(has_obj[h]) + "+" + str(has_expl[h]),
+            "cl_lex=" + hst + "+" + m_mark + "+" + str(has_subj[m]) + "+" + str(other_obj_left or other_obj_right) + "+" + str(has_expl[h]),
             "cl_aux=" + m_aux + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hu,
             "cl_rel=" + hu + "+" + w_after_h + "+" + bt_after_h + "+" + str(has_subj[m]) + "+" + dr,
             "cl_lc1=" + hu + "+" + m_lc1_w + "+" + m_lc1_bt + "+" + str(has_subj[m]) + "+" + dr,
 
-            # Full-tree passive & subject/object disambiguation
+            # Full-tree passive & subject/object/iobj/obl:unmarked uniqueness disambiguation
             "pass_full=" + str(has_pass[h]) + "+" + h_aux + "+" + mu + "+" + mbt + "+" + dr + "+" + m_case,
-            "obj_full=" + str(has_obj[h]) + "+" + str(has_cop[h]) + "+" + mu + "+" + mbt + "+" + dr,
+            "obj_full=" + str(other_obj_left) + "+" + str(other_obj_right) + "+" + str(has_cop[h]) + "+" + mu + "+" + mbt + "+" + dr,
+            "subj_uniq=" + str(other_left_subj) + "+" + str(has_expl[h]) + "+" + str(has_cop[h]) + "+" + mu + "+" + mbt + "+" + dr,
 
             # Pre-nominal (compound vs amod vs flat vs det vs nmod:poss) disambiguation
             "nom_full=" + mu + "+" + hu + "+" + msig + "+" + hsig + "+" + dr + "+" + dist + "+" + str(has_det[m]),
@@ -2337,7 +2357,7 @@ class FullTreeLabeler:
                 stags = supertags_list[k] if supertags_list is not None else None
                 utags = upos_list[k] if upos_list is not None else None
 
-                if mst_list is not None and rng.random() < 0.25:
+                if mst_list is not None and rng.random() < 0.30:
                     heads = mst_list[k]["heads"]
                 else:
                     heads = gold_heads

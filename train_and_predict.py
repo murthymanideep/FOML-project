@@ -61,11 +61,11 @@ BEST_SETTINGS = "best_settings.json"
 UPOS_EPOCHS = 6
 TAGGER_EPOCHS = 6
 SUPERTAGGER_EPOCHS = 5
-TAGGER_SEEDS = 2
+TAGGER_SEEDS = 3
 MST_EPOCHS = 8
-MST_SEEDS = 3
+MST_SEEDS = 4
 TREE_LABELER_EPOCHS = 6
-TREE_LABELER_SEEDS = 3
+TREE_LABELER_SEEDS = 4
 JACKKNIFE_FOLDS = 5
 PARSER_EPOCHS = 12
 
@@ -74,7 +74,7 @@ CHECK_GROUP_SIZE = 100
 COMBINER_MIN_GAIN = 0.10
 L2_GRID = [1.0, 5.0, 15.0]
 
-# Balanced 15-parser ensemble across 3 transition systems and both reading directions:
+# Balanced 18-parser ensemble across 3 transition systems and both reading directions:
 # (system_type, direction, seed, vote_weight)
 PARSERS = [
     ("arc-hybrid",   "left-to-right", 1, 1.35),
@@ -92,6 +92,9 @@ PARSERS = [
     ("arc-hybrid",   "left-to-right", 3, 1.30),
     ("arc-eager",    "left-to-right", 3, 1.20),
     ("arc-standard", "left-to-right", 3, 1.15),
+    ("arc-hybrid",   "left-to-right", 4, 1.25),
+    ("arc-eager",    "left-to-right", 4, 1.15),
+    ("arc-standard", "left-to-right", 4, 1.10),
 ]
 
 DEFAULT_RULES = {
@@ -512,16 +515,22 @@ def vote(outputs):
         if mst_list is not None and mst_list[k] is not None:
             minfo = mst_list[k]
             mh1, mh2, mh3, mconf = minfo["heads"], minfo["heads2"], minfo.get("heads3"), minfo["conf"]
+            mmarg = minfo.get("margins")
+            mst_scale = max(len(predictions) / 12.0, 1.0)
             for i in range(1, n + 1):
                 h1 = mh1[i]
                 h2 = mh2[i]
                 h3 = mh3[i] if mh3 is not None else -1
                 if 0 <= h1 <= n and h1 != i:
-                    arc_scores[h1, i] += 1.05 if mconf[i] == "HIGH" else (0.72 if mconf[i] == "MID" else 0.45)
+                    base_b = 1.05 if mconf[i] == "HIGH" else (0.72 if mconf[i] == "MID" else 0.45)
+                    if mmarg is not None:
+                        cont_b = 0.45 + 0.65 * (min(max(float(mmarg[i]), 0.0), 8.0) / 8.0)
+                        base_b = 0.5 * (base_b + cont_b)
+                    arc_scores[h1, i] += mst_scale * base_b
                 if 0 <= h2 <= n and h2 != i:
-                    arc_scores[h2, i] += 0.22
+                    arc_scores[h2, i] += mst_scale * 0.22
                 if 0 <= h3 <= n and h3 != i:
-                    arc_scores[h3, i] += 0.08
+                    arc_scores[h3, i] += mst_scale * 0.08
 
         heads = chu_liu_edmonds(arc_scores)
 
@@ -556,11 +565,12 @@ def vote(outputs):
             if tree_scores is not None and tree_scores[i] is not None:
                 t_map = tree_scores[i]
                 if t_map:
+                    lbl_scale = max(len(predictions) / 12.0, 1.0)
                     max_ts = max(t_map.values())
                     for lab, ts in t_map.items():
                         diff = ts - max_ts
                         if diff >= -8.0:
-                            label_votes[lab] = label_votes.get(lab, 0.0) + 1.25 * math.exp(0.25 * diff)
+                            label_votes[lab] = label_votes.get(lab, 0.0) + (1.25 * lbl_scale) * math.exp(0.25 * diff)
                             if lab not in first_seen:
                                 first_seen[lab] = len(predictions)
 
