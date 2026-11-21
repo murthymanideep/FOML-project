@@ -469,7 +469,7 @@ def predict_heads(outputs, arc_weights, sentence_ids):
 # ----------------------------- labels -----------------------------
 
 def labeler_scores(outputs, k, heads):
-    """Scores of the (1- or 2-seed) full-tree labeler for every word of sentence k, given a tree."""
+    """Scores of the full-tree labeler ensemble for every word of sentence k."""
     labeler = outputs["tree_labeler"]
     if labeler is None:
         return None
@@ -481,7 +481,7 @@ def labeler_scores(outputs, k, heads):
         get_supertags(outputs, k),
         heads,
         upos=upos,
-        second_model=outputs.get("tree_labeler_2"),
+        extra_models=outputs.get("extra_labelers"),
     )
 
 

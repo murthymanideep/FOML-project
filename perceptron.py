@@ -1,6 +1,5 @@
 """
-Multi-class averaged perceptron with hashed features and
-passive-aggressive (PA-I) step sizes.
+Multi-class averaged perceptron with bitmasked feature hashing.
 """
 
 import numpy as np
@@ -33,8 +32,8 @@ class AveragedPerceptron:
         return self.weights[rows].sum(axis=0)
 
     def update(self, rows, correct_class, predicted_class, scale=1.0):
-        """Reward the right class and penalize the predicted one."""
-        if correct_class == predicted_class or scale == 0.0:
+        """Reward the correct class and penalize the predicted class."""
+        if correct_class == predicted_class:
             return
         step_scale = np.float32(scale * self.step)
         s = np.float32(scale)
@@ -43,29 +42,8 @@ class AveragedPerceptron:
         self.totals[rows, correct_class] += step_scale
         self.totals[rows, predicted_class] -= step_scale
 
-    def update_pa(self, rows, correct_class, predicted_class, scores, margin=10.0, cap=1.0):
-        """Passive-aggressive (PA-I) update scaled by the number of active features."""
-        if correct_class == predicted_class:
-            return
-        loss = margin - (float(scores[correct_class]) - float(scores[predicted_class]))
-        if loss <= 0.0:
-            return
-        tau = loss / (2.0 * max(len(rows), 1))
-        if tau > cap:
-            tau = cap
-        self.update(rows, correct_class, predicted_class, scale=tau)
-
-    def update_one_class(self, rows, class_idx, delta):
-        """Add delta to a single class for the given feature rows."""
-        if delta == 0.0 or len(rows) == 0:
-            return
-        d = np.float32(delta)
-        sd = np.float32(delta * self.step)
-        self.weights[rows, class_idx] += d
-        self.totals[rows, class_idx] += sd
-
     def next_step(self):
-        """Advance the step counter after each sentence."""
+        """Advance the step counter after each training sentence."""
         self.step += 1
 
     def average_weights(self):

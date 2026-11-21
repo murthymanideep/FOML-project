@@ -19,8 +19,6 @@ import csv
 import os
 import sys
 
-import numpy as np
-
 
 ROOT_WORD = "<ROOT>"
 
@@ -442,7 +440,7 @@ def head_offset_bucket(index, head):
     return "-4-"
 
 
-def build_lexicon(sentences, word_clusters=None):
+def build_lexicon(sentences):
     """
     Build an empirical word, stem, & morphological signature lexicon from
     training sentences. Also captures left/right neighbor tag context to form
@@ -557,7 +555,6 @@ def build_lexicon(sentences, word_clusters=None):
         "stem_ambiguity": stem_ambiguity,
         "sig_dominant": sig_dominant,
         "sig_ambiguity": sig_ambiguity,
-        "word_clusters": word_clusters,
     }
 
 
@@ -606,225 +603,3 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
     clu = "SIG_" + sig
     fb = "SINGLE" if total == 1 else "OOV"
     return (dom, amb, crs, clu, fb)
-
-
-def _xlogx(x):
-    """Safe x * log(x) with 0 * log(0) = 0."""
-    return np.where(x > 0.0, x * np.log(np.maximum(x, 1.0)), 0.0)
-
-
-def build_word_clusters(sentences, n_fine=64, n_coarse=16, min_count=3, n_iters=6):
-    """
-    Group words into n_fine and n_coarse distributional clusters using bigram
-    exchange clustering on the training words only. Rare words fall back to
-    their word signature so unseen words still get a cluster.
-    """
-    raw_counts = {}
-    for s in sentences:
-        words = s["words"]
-        for i in range(1, len(words)):
-            nw = normalize_word(words[i])
-            raw_counts[nw] = raw_counts.get(nw, 0) + 1
-
-    vocab_counts = {}
-    corpus_seqs = []
-    for s in sentences:
-        words = s["words"]
-        seq = []
-        for i in range(1, len(words)):
-            nw = normalize_word(words[i])
-            if raw_counts.get(nw, 0) >= min_count:
-                key = nw
-            else:
-                key = "<SIG>:" + word_signature(words[i], i)
-            seq.append(key)
-            vocab_counts[key] = vocab_counts.get(key, 0) + 1
-        if seq:
-            corpus_seqs.append(seq)
-
-    vocab_keys = sorted(vocab_counts.keys(), key=lambda k: (-vocab_counts[k], k))
-    n_vocab = len(vocab_keys)
-    if n_vocab <= 2:
-        return {}
-
-    C = min(n_fine, n_vocab)
-    BOS_CLASS = C
-    EOS_CLASS = C + 1
-    N_TOT = C + 2
-
-    id_of = {k: idx for idx, k in enumerate(vocab_keys)}
-    BOS_ID = n_vocab
-    EOS_ID = n_vocab + 1
-
-    word_count = np.array([vocab_counts[k] for k in vocab_keys], dtype=np.float64)
-    out_edges = [{} for _ in range(n_vocab)]
-    in_edges = [{} for _ in range(n_vocab)]
-    self_loops = np.zeros(n_vocab, dtype=np.float64)
-
-    for seq in corpus_seqs:
-        prev = BOS_ID
-        for key in seq:
-            curr = id_of[key]
-            if prev == curr:
-                self_loops[curr] += 1.0
-            else:
-                in_edges[curr][prev] = in_edges[curr].get(prev, 0.0) + 1.0
-                if prev != BOS_ID:
-                    out_edges[prev][curr] = out_edges[prev].get(curr, 0.0) + 1.0
-            prev = curr
-        out_edges[prev][EOS_ID] = out_edges[prev].get(EOS_ID, 0.0) + 1.0
-
-    # Put the most frequent words in their own classes, spread the rest evenly
-    word_class = np.zeros(n_vocab + 2, dtype=np.int32)
-    word_class[BOS_ID] = BOS_CLASS
-    word_class[EOS_ID] = EOS_CLASS
-    for w in range(n_vocab):
-        word_class[w] = w if w < C - 1 else w % C
-
-    out_nbrs = [np.fromiter(d.keys(), dtype=np.int32, count=len(d)) for d in out_edges]
-    out_cnts = [np.fromiter(d.values(), dtype=np.float64, count=len(d)) for d in out_edges]
-    in_nbrs = [np.fromiter(d.keys(), dtype=np.int32, count=len(d)) for d in in_edges]
-    in_cnts = [np.fromiter(d.values(), dtype=np.float64, count=len(d)) for d in in_edges]
-
-    cnt = np.zeros(N_TOT, dtype=np.float64)
-    B = np.zeros((N_TOT, N_TOT), dtype=np.float64)
-    cnt[BOS_CLASS] = float(len(corpus_seqs))
-    cnt[EOS_CLASS] = float(len(corpus_seqs))
-    for w in range(n_vocab):
-        cw = word_class[w]
-        cnt[cw] += word_count[w]
-        if self_loops[w] > 0.0:
-            B[cw, cw] += self_loops[w]
-        if len(out_nbrs[w]) > 0:
-            np.add.at(B[cw], word_class[out_nbrs[w]], out_cnts[w])
-    for w in range(n_vocab):
-        bos_c = in_edges[w].get(BOS_ID, 0.0)
-        if bos_c > 0.0:
-            B[BOS_CLASS, word_class[w]] += bos_c
-
-    # Move each word to whichever class maximizes bigram log-likelihood
-    for _ in range(n_iters):
-        moved = 0
-        for w in range(n_vocab):
-            c_old = int(word_class[w])
-            nw = word_count[w]
-            sw = self_loops[w]
-
-            out_c = np.zeros(N_TOT, dtype=np.float64)
-            if len(out_nbrs[w]) > 0:
-                np.add.at(out_c, word_class[out_nbrs[w]], out_cnts[w])
-            in_c = np.zeros(N_TOT, dtype=np.float64)
-            if len(in_nbrs[w]) > 0:
-                np.add.at(in_c, word_class[in_nbrs[w]], in_cnts[w])
-
-            cnt[c_old] -= nw
-            B[c_old, :] -= out_c
-            B[:, c_old] -= in_c
-            B[c_old, c_old] -= sw
-
-            cnt_cand = cnt[:C]
-            delta = -2.0 * (_xlogx(cnt_cand + nw) - _xlogx(cnt_cand))
-
-            nz_out = np.nonzero(out_c)[0]
-            if len(nz_out) > 0:
-                B_rows = B[:C, nz_out]
-                delta += (_xlogx(B_rows + out_c[nz_out]) - _xlogx(B_rows)).sum(axis=1)
-
-            nz_in = np.nonzero(in_c)[0]
-            if len(nz_in) > 0:
-                B_cols = B[nz_in, :C]
-                delta += (_xlogx(B_cols + in_c[nz_in, None]) - _xlogx(B_cols)).sum(axis=0)
-
-            diag_B = np.diag(B)[:C]
-            o_d = out_c[:C]
-            i_d = in_c[:C]
-            delta -= _xlogx(diag_B + o_d) - _xlogx(diag_B)
-            delta -= _xlogx(diag_B + i_d) - _xlogx(diag_B)
-            delta += _xlogx(diag_B + o_d + i_d + sw) - _xlogx(diag_B)
-
-            c_best = int(np.argmax(delta))
-            cnt[c_best] += nw
-            B[c_best, :] += out_c
-            B[:, c_best] += in_c
-            B[c_best, c_best] += sw
-            word_class[w] = c_best
-            if c_best != c_old:
-                moved += 1
-        if moved == 0:
-            break
-
-    # Greedily merge fine clusters down to n_coarse clusters
-    active = [c for c in range(C) if cnt[c] > 0.0]
-    B_m = B.copy()
-    cnt_m = cnt.copy()
-    members = {c: [c] for c in active}
-
-    target_coarse = min(n_coarse, len(active))
-    while len(active) > target_coarse:
-        best_loss = -1.0e30
-        best_pair = (active[0], active[1])
-        m_act = len(active)
-        for ia in range(m_act):
-            a = active[ia]
-            row_a = B_m[a, :]
-            col_a = B_m[:, a]
-            ca = cnt_m[a]
-            for ib in range(ia + 1, m_act):
-                b = active[ib]
-                row_b = B_m[b, :]
-                col_b = B_m[:, b]
-                cb = cnt_m[b]
-                dL = -2.0 * (_xlogx(ca + cb) - _xlogx(ca) - _xlogx(cb))
-                dL += float((_xlogx(row_a + row_b) - _xlogx(row_a) - _xlogx(row_b)).sum())
-                dL += float((_xlogx(col_a + col_b) - _xlogx(col_a) - _xlogx(col_b)).sum())
-                aa, ab, ba, bb = B_m[a, a], B_m[a, b], B_m[b, a], B_m[b, b]
-                dL -= float(_xlogx(aa + ba) - _xlogx(aa) - _xlogx(ba))
-                dL -= float(_xlogx(ab + bb) - _xlogx(ab) - _xlogx(bb))
-                dL -= float(_xlogx(aa + ab) - _xlogx(aa) - _xlogx(ab))
-                dL -= float(_xlogx(ba + bb) - _xlogx(ba) - _xlogx(bb))
-                dL += float(_xlogx(aa + ab + ba + bb) - _xlogx(aa) - _xlogx(ab) - _xlogx(ba) - _xlogx(bb))
-                if dL > best_loss:
-                    best_loss = dL
-                    best_pair = (a, b)
-        a, b = best_pair
-        B_m[a, :] += B_m[b, :]
-        B_m[:, a] += B_m[:, b]
-        B_m[b, :] = 0.0
-        B_m[:, b] = 0.0
-        cnt_m[a] += cnt_m[b]
-        cnt_m[b] = 0.0
-        members[a].extend(members[b])
-        del members[b]
-        active.remove(b)
-
-    coarse_map = {}
-    for new_cid, root_c in enumerate(sorted(active)):
-        for orig_c in members[root_c]:
-            coarse_map[orig_c] = new_cid
-
-    fine_order = sorted(range(C), key=lambda c: (-cnt[c], c))
-    fine_renum = {old_c: new_i for new_i, old_c in enumerate(fine_order)}
-
-    clusters = {}
-    for w, key in enumerate(vocab_keys):
-        fc = int(word_class[w])
-        clusters[key] = ("F%02d" % fine_renum[fc], "C%02d" % coarse_map.get(fc, 0))
-    return clusters
-
-
-def lookup_word_clusters(lexicon, raw_word, normal_word, position):
-    """Look up (fine_cluster, coarse_cluster) for a word, falling back to its signature."""
-    if raw_word == ROOT_WORD:
-        return ("FROOT", "CROOT")
-    if lexicon is None:
-        return ("FUNK", "CUNK")
-    wc = lexicon.get("word_clusters")
-    if not wc:
-        return ("FUNK", "CUNK")
-    res = wc.get(normal_word)
-    if res is not None:
-        return res
-    res = wc.get("<SIG>:" + word_signature(raw_word, position))
-    if res is not None:
-        return res
-    return ("FUNK", "CUNK")
