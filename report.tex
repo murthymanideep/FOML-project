@@ -1,6 +1,6 @@
 \documentclass[11pt,a4paper]{article}
 
-\usepackage[margin=0.95in]{geometry}
+\usepackage[margin=0.9in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{array}
@@ -17,8 +17,8 @@
     citecolor=blue!60!black
 }
 
-\title{\textbf{FOML Project Report}\\[0.3em]
-\large Structured Prediction for Dependency Parsing}
+\title{\textbf{FOML Kaggle Competition}\\[0.25em]
+\large Dependency Parsing Project Report}
 
 \author{
     \textbf{Murthy Manideep} (CS24BTECH11039) \and
@@ -33,187 +33,242 @@
 
 \section{Introduction}
 
-In this project, we built a dependency parser for the FoML 2026 Hackathon. Given a sentence of words $w_1, w_2, \dots, w_n$ (plus a dummy root $w_0 = \texttt{<ROOT>}$), we need to build a parse tree over the sentence. For each word $i \in \{1, \dots, n\}$, we predict:
-\begin{itemize}[noitemsep]
-    \item its \textbf{head} $h_i \in \{0, 1, \dots, n\} \setminus \{i\}$, where $0$ means the root of the sentence, and
-    \item its \textbf{label} $\ell_i$, which is the grammar relation to its head (like \texttt{nsubj}, \texttt{obj}, \texttt{det}, \texttt{obl}, \texttt{nmod}, or \texttt{punct}).
-\end{itemize}
-Each prediction is saved as \texttt{HEAD|LABEL}. Accuracy is measured using \textbf{Labeled Attachment Score (LAS)}, where a word is right only if both its head and label are right. While testing our models, we also checked \textbf{Unlabeled Attachment Score (UAS)} (head accuracy alone) so we could tell whether mistakes came from wrong heads or wrong labels.
+Dependency parsing is the task of finding how words in a sentence connect to each other grammatically. Given an input sentence of words $(w_1, w_2, \dots, w_n)$ and a dummy root token $w_0 = \texttt{<ROOT>}$, a valid parse tree assigns two values to every word $i \in \{1, \dots, n\}$:
+\begin{enumerate}[noitemsep]
+    \item \textbf{Head Index ($h_i$):} The index of the parent word it depends on ($h_i = 0$ means the word attaches directly to the sentence root).
+    \item \textbf{Relation Label ($\ell_i$):} The grammatical role linking the parent to the word (such as \texttt{nsubj} for subject, \texttt{obj} for object, \texttt{amod} for adjective, or \texttt{punct} for punctuation).
+\end{enumerate}
 
-We wrote the entire codebase in Python using only \texttt{numpy} and Python's built-in modules, using averaged perceptrons, Chu-Liu/Edmonds tree building, graph-based parsing, and transition-based parsing.
+Predictions are written in the format \texttt{HEAD|LABEL} (for example, \texttt{3|det}). Accuracy is evaluated using \textbf{Labeled Attachment Score (LAS)}, which counts a prediction as right only when both the head and the label match the true answer:
+\begin{equation}
+\text{LAS} = \frac{\text{Number of words with correct head and correct label}}{\text{Total number of words}}.
+\end{equation}
+We also track \textbf{Unlabeled Attachment Score (UAS)}, which measures the share of words with the right head regardless of the label:
+\begin{equation}
+\text{UAS} = \frac{\text{Number of words with correct head}}{\text{Total number of words}}.
+\end{equation}
+Checking UAS alongside LAS makes it easy to see whether mistakes come from wrong tree edges or wrong relation labels.
 
-\section{Data and Validation Setup}
+\section{Data and Validation Strategy}
 
-The dataset has \textbf{12,439 training sentences} in \texttt{train.csv} and \textbf{2,077 test sentences} in \texttt{test.csv}. Only the words are given, with no POS tags or lemmas.
+The dataset contains \textbf{12,439 training sentences} (202,689 words) in \texttt{train.csv} and \textbf{2,077 test sentences} (25,094 words) in \texttt{test.csv}. Only the raw words are provided, with no part-of-speech tags or lemmas.
 
-\subsection{Block Validation Split (\texttt{--check})}
-In our first tries, we kept every 10th single sentence for validation. That gave higher validation scores than Kaggle because nearby sentences in the file often come from the same article and share the same names and words (only 3.9\% new words in validation vs.\ 6.3\% in \texttt{test.csv}).
+\subsection{Block Validation Split}
+Evaluating on randomly picked sentences gives overly optimistic scores in this dataset. Sentences next to each other in the file usually come from the same article, so they share the same topic, names, and rare words. When holding out every 10th individual sentence, the validation split had only 3.9\% unseen words compared to 6.3\% in \texttt{test.csv}.
 
-To make validation closer to the real test set, our \texttt{--check} mode groups \texttt{train.csv} into \textbf{blocks of 100 neighboring sentences} and holds out every 10th block (90\% train, 10\% validation). That raised the unseen word rate to 5.0\%. We used this split to test our features, parser combinations, and rules.
+To make local validation closer to the real test set during development, we split the training data into \textbf{blocks of 100 neighboring sentences} and kept every 10th block as validation data (90\% train and 10\% validation). Keeping neighboring sentences together meant the validation split contained unseen documents, raising the unseen word rate to 5.0\%. We used this split to test our features, models, and rules.
 
 \subsection{5-Fold Cross-Validation Inside the Pipeline}
-Our later models (transition parsers and the tree labeler) use predictions from earlier models (taggers and the MST parser) as input features. If a tagger predicted on the same sentences it trained on, those tags would be almost 100\% right on train but noisier on test, causing the parsers to overfit.
+Later models in our pipeline (the transition parsers and the tree labeler) take predictions from earlier models (the taggers and the Graph-MST parser) as input features. If a tagger predicts on the same sentences it trained on, its training predictions will be almost 100\% accurate, while its test predictions will have small mistakes. If downstream parsers only see clean training tags, they will overfit and make more errors on test data.
 
-To avoid this, every earlier stage runs \textbf{5-fold cross-validation} on the training set (and builds a separate word stats table inside each fold). That way, the parsers train on realistic tag and MST mistakes that look like what they will see on test data.
+To avoid this, we split the training data into \textbf{five folds}. For each fold, earlier models were trained on the other four folds (with a fold-specific word stats table) and used to predict on the held-out fold. That way, downstream parsers trained on realistic, slightly noisy features matching test time.
 
-\section{Pipeline and Models}
+\section{System Architecture and Models}
 
-Our final system has six steps across six Python files: \texttt{perceptron.py}, \texttt{data\_utils.py}, \texttt{tagger.py}, \texttt{parser.py}, \texttt{combiner.py}, and \texttt{train\_and\_predict.py}.
+Our full pipeline is organized into seven sequential stages across five Python files (\texttt{perceptron.py}, \texttt{data\_utils.py}, \texttt{tagger.py}, \texttt{parser.py}, and \texttt{train\_and\_predict.py}):
+\begin{enumerate}[noitemsep]
+    \item \textbf{Stage 1 (Word Cleaning \& Stats):} Raw tokens are cleaned, common patterns (numbers, URLs, years, etc.) are grouped, and three small word sets (punctuation, standalone words, possessive markers) are learned from the training trees.
+    \item \textbf{Stage 2 (Five Sequence Taggers):} Sequence taggers predict 18 word classes, left-to-right and right-to-left directional tags, combined tags, and head-distance tags using 5-fold cross-validation.
+    \item \textbf{Stage 3 (Graph-Based MST Parser):} All pairwise word connections are scored at once using 42 feature templates and decoded into a tree using the Chu-Liu/Edmonds algorithm.
+    \item \textbf{Stage 4 (18 Transition Parsers):} An ensemble of 18 parsers across three transition types (Arc-Hybrid, Arc-Eager, Arc-Standard) builds trees step by step using mistake-recovery training.
+    \item \textbf{Stage 5 (Ensemble Voting \& Tree Building):} Votes from all 18 transition parsers and the scaled Graph-MST model are combined, and Chu-Liu/Edmonds removes any cycles to produce one valid single-root tree.
+    \item \textbf{Stage 6 (Full-Tree Relation Labeler):} Looking at the full tree, a 4-seed label classifier predicts relation labels while checking whether a parent already has another subject or object child.
+    \item \textbf{Stage 7 (Post-Processing Rules):} Four simple rules clean up punctuation labels, multi-word proper names, passive subjects, and \texttt{obl}/\texttt{nmod} labels.
+\end{enumerate}
 
 \subsection{Averaged Perceptron}
-All of our taggers, parsers, and the tree labeler use an \textbf{averaged perceptron with a small margin}. For an input $x$ and a choice $y$, the score is:
-\[
+All sequence taggers, transition parsers, and the tree labeler use a linear multi-class averaged perceptron (\texttt{perceptron.py}). For an input $x$ and candidate choice $y$, the linear score is:
+\begin{equation}
 s(x, y) = \mathbf{w}^\top \phi(x, y).
-\]
-Feature strings are hashed into a fixed-size weight table ($2^{20}$ rows for taggers and labeler, $2^{21}$ rows for transition parsers, and $2^{22}$ rows for Graph-MST). During training, we add a small penalty $\Delta(y, y^*) > 0$ to wrong choices ($\Delta = 0.5$ for taggers and labeler, $\Delta = 1.0$ for parsers) so the correct answer stays clearly above close wrong choices:
-\[
-\hat{y} = \arg\max_{y} \big(\mathbf{w}^\top \phi(x, y) + \Delta(y, y^*)\big).
-\]
-Whenever $\hat{y} \neq y^*$, we update the weights by 1:
-\[
-\mathbf{w} \leftarrow \mathbf{w} + \phi(x, y^*) - \phi(x, \hat{y}).
-\]
-At the end of training, we average the weights across all training steps, $\bar{\mathbf{w}} = \frac{1}{T}\sum_{t=1}^{T}\mathbf{w}^{(t)}$. Averaging keeps the weights smooth and helps a lot on unseen test sentences.
+\end{equation}
+Instead of storing a large string dictionary, features are hashed into a fixed-size weight table ($2^{20} = 1,048,576$ rows for taggers and labeler; $2^{21}$ for transition parsers; $2^{22}$ for Graph-MST).
 
-\subsection{Step 1: Word Cleaning, Stats, and Learned Word Groups}
-In \texttt{data\_utils.py}, we clean the words and collect simple word features before training:
+During training, a small margin $\Delta$ is added to wrong choices ($\Delta = 0.5$ for taggers and labeler, $\Delta = 1.0$ for parsers) so the right answer wins with a clear gap:
+\begin{equation}
+\hat{y} = \arg\max_{y} \big(\mathbf{w}^\top \phi(x, y) + \Delta(y, y^*)\big).
+\end{equation}
+Whenever the predicted choice $\hat{y}$ is wrong, we add 1 to the weights of the right choice's features and subtract 1 from the predicted choice's features.
+
+At the end of training, we average the weights across all training steps:
+\begin{equation}
+\bar{\mathbf{w}} = \frac{1}{T} \sum_{t=1}^{T} \mathbf{w}^{(t)}.
+\end{equation}
+Weight averaging stops the model from overfitting to individual sentences and improves accuracy on unseen test words.
+
+\subsection{Word Cleaning and Learned Word Groups}
+All word statistics and word groups are built directly from \texttt{train.csv} (\texttt{data\_utils.py}):
 \begin{itemize}[noitemsep]
-    \item \textbf{Word cleaning:} We lowercase words, remove apostrophes (because the data has both ``we ve'' and ``n't''), and replace URLs, emails, 4-digit years, percentages, money, times, and numbers with common tokens (\texttt{<URL>}, \texttt{<YEAR>}, \texttt{<NUMBER>}, etc.).
-    \item \textbf{Stems and word patterns:} We take the first 5 letters as a simple stem, and build character patterns using capitals (\texttt{ALL\_CAP}, \texttt{INIT\_CAP}, \texttt{MID\_CAP}, \texttt{MIX\_CAP}, \texttt{LOW}), digits, hyphens, and the last 3 letters.
-    \item \textbf{Word stats table:} From the training fold only, we save each word's most common tag, its top-2 common tags, its coarse tag group, and its most common left and right neighbor groups. For rare or unseen words, we fall back to the 5-letter stem and then to the character pattern.
-    \item \textbf{Learned word groups:} We learn three small word sets directly from \texttt{train.csv}:
+    \item \textbf{Word Cleaning:} All words are lowercased and apostrophes are removed so different spellings match (such as ``we ve'' and ``we've'', or ``n't'' and ``nt''). Numbers, 4-digit years, URLs, emails, times, percentages, and currency amounts are mapped to common placeholder tags (\texttt{<URL>}, \texttt{<YEAR>}, \texttt{<NUMBER>}, etc.).
+    \item \textbf{Word Stems and Shapes:} Each word is represented by its first 5 letters (simple stem), its last 3 letters (suffix like \texttt{-ing} or \texttt{-ed}), and its capital-letter pattern (\texttt{ALL\_CAP}, \texttt{INIT\_CAP}, \texttt{MID\_CAP}, \texttt{MIX\_CAP}, \texttt{LOW}).
+    \item \textbf{Learned Word Groups:} Three small word sets are learned directly from the training trees:
     \begin{enumerate}[noitemsep]
-        \item \emph{Punctuation forms:} tokens labeled \texttt{punct} at least 98\% of the time (seen $\ge 3$ times). This avoids marking symbols like \texttt{\&} (\texttt{cc}), \texttt{\$} (money head), \texttt{\%} (noun), and \texttt{:)} (\texttt{discourse}) as \texttt{punct}.
-        \item \emph{Standalone words:} common noun/pronoun-like words ($\ge 60\%$ nominal labels) that almost never have determiner, adjective, or compound children ($\le 2\%$), which finds pronouns and standalone names.
-        \item \emph{Possessive words:} \texttt{case} words whose head is \texttt{nmod:poss} at least 80\% of the time.
+        \item \emph{True Punctuation:} Words labeled \texttt{punct} at least 98\% of the time (seen $\ge 3$ times). This picks up real punctuation (like \texttt{.} and \texttt{,}) without mislabeling symbols that have grammar roles (such as \texttt{\&} as conjunction \texttt{cc}, \texttt{\$} as currency head, and \texttt{\%} as noun).
+        \item \emph{Standalone Words / Pronouns:} Frequent nominal words ($\ge 60\%$) that almost never take determiners, adjectives, or compounds ($\le 2\%$), which naturally picks up pronouns like ``he'', ``it'', and ``they''.
+        \item \emph{Possessive Markers:} \texttt{case} words whose parent is \texttt{nmod:poss} at least 80\% of the time (identifying the possessive marker).
     \end{enumerate}
 \end{itemize}
 
-\subsection{Steps 2--4: Five Sequence Taggers (3 Seeds Averaged)}
-Because POS tags are not given in the data, we train five taggers in \texttt{tagger.py} to give useful grammar hints to the parsers. Each tagger uses 5-fold CV on train and \textbf{3-seed weight averaging} on test:
+\subsection{Five Sequence Taggers (3 Seeds Averaged)}
+Because POS tags are not given in the dataset, five sequence taggers are trained in \texttt{tagger.py} to give useful grammar hints to the parsers:
 \begin{enumerate}[noitemsep]
-    \item \textbf{Word-Class Tagger (UPOS, 6 epochs):} Builds 18 word classes (\texttt{NOUN}, \texttt{PROPN}, \texttt{PRON}, \texttt{VERB}, \texttt{VERB\_VBN}, \texttt{VERB\_INF}, \texttt{ADJ}, \texttt{ADV}, \texttt{ADP}, \texttt{DET}, \texttt{AUX}, \texttt{COP}, \texttt{CCONJ}, \texttt{SCONJ}, \texttt{NUM}, \texttt{PART}, \texttt{INTJ}, \texttt{PUNCT}) from the training trees and learns to predict them on new sentences.
-    \item \textbf{Left-to-Right Tagger (6 epochs):} Reads left to right and guesses each word's label and head direction (like \texttt{det>}, \texttt{obj<}, \texttt{root}).
-    \item \textbf{Right-to-Left Tagger (6 epochs):} Reads right to left so it can see words coming after the current word.
-    \item \textbf{Combined Tagger (6 epochs):} Takes the left-to-right tags, right-to-left tags, whether they agree, UPOS tags, and distances to the nearest root, verb, and noun.
-    \item \textbf{Head-Distance Tagger (5 epochs):} Predicts how far away each word's head is and what type of word the head is (for example \texttt{+1:OBJ}, \texttt{-2:CLAUSE}, \texttt{ROOT:ROOT}).
+    \item \textbf{Word-Class Tagger (18 classes, 6 epochs):} Builds 18 POS-like classes (\texttt{NOUN}, \texttt{PROPN}, \texttt{PRON}, \texttt{VERB}, \texttt{ADJ}, \texttt{ADV}, \texttt{ADP}, \texttt{DET}, \texttt{PUNCT}, etc.) from the training trees. Reaches \textbf{94.79\% 5-fold CV accuracy}.
+    \item \textbf{Left-to-Right Role Tagger (6 epochs):} Reads left to right, predicting each word's relation and head direction (like \texttt{nsubj>}, \texttt{obj<}, \texttt{root}). Reaches \textbf{84.98\% 5-fold CV accuracy}.
+    \item \textbf{Right-to-Left Role Tagger (6 epochs):} Reads right to left so it can use words coming later in the sentence. Reaches \textbf{84.78\% 5-fold CV accuracy}.
+    \item \textbf{Combined Both-Direction Tagger (6 epochs):} Combines both passes, checks whether they agree, and adds distances to the nearest verb and noun. Improves accuracy to \textbf{85.34\% 5-fold CV}.
+    \item \textbf{Head-Distance Tagger (5 epochs):} Predicts roughly how far away the parent word is and what type of word the parent is (such as \texttt{+1:OBJ}, \texttt{-2:CLAUSE}, \texttt{ROOT:ROOT}). Reaches \textbf{80.34\% 5-fold CV accuracy}.
 \end{enumerate}
+For test prediction, each tagger averages weights across three random seeds to reduce variance.
 
-\subsection{Step 5: Graph-MST Parser (4 Seeds Averaged)}
-In \texttt{parser.py}, \texttt{GraphMSTParser} scores every possible edge $(h \to m)$ in a sentence at once using \textbf{42 fast numpy feature templates} (head and child words, stems, tags, UPOS, word stats, character patterns, direction and distance, counts of verbs/commas/conjunctions in between, neighbor tags, and head-distance tag matches).
-
-Given the $(n+1)\times(n+1)$ edge score matrix $S$, we pick the best single-root tree rooted at token $0$:
-\[
-T^* = \arg\max_{T \in \mathcal{T}_1(n)} \sum_{m=1}^{n} S[\text{head}_T(m), m]
-\]
-using the recursive \textbf{Chu-Liu/Edmonds (CLE)} algorithm, making sure only one word attaches to $0$ (single root) and punctuation tokens cannot be heads of normal words. On train we run 5-fold CV (8 epochs), and on test we average the score matrices from \textbf{4 random seeds} before picking the tree. The MST output helps twice: it gives top-2 head hints and confidence levels (\texttt{HIGH}, \texttt{MID}, \texttt{LOW}) to every transition parser, and it also votes in the final tree selection.
-
-\subsection{Step 6: 18 Transition Parsers, 4-Seed Tree Labeler, and Voting}
-
-\paragraph{18 Transition Parsers (3 Types).}
-Transition parsers build the tree one move at a time using a stack and a buffer. Because parts of the tree are already built as they go, they can check already-attached children, grandchildren, child counts, prepositions, auxiliaries, and child labels. To get better accuracy and lower variance, we train \textbf{18 parsers split evenly across three types}:
+\subsection{Graph-Based MST Parser (4 Seeds Averaged)}
+In \texttt{parser.py}, \texttt{GraphMSTParser} scores every possible parent-child edge $(h \to m)$ in a sentence at once using \textbf{42 fast NumPy feature templates}. Features look at:
 \begin{itemize}[noitemsep]
-    \item \textbf{Arc-Hybrid} (6 parsers: 4 left-to-right, 2 right-to-left): makes right edges bottom-up and left edges between stack and buffer.
-    \item \textbf{Arc-Eager} (6 parsers: 4 left-to-right, 2 right-to-left): makes right edges top-down with a \texttt{REDUCE} move and uses already-assigned parent labels.
-    \item \textbf{Arc-Standard} (6 parsers: 4 left-to-right, 2 right-to-left): makes both left and right edges between the top two stack words while looking at the next buffer word.
+    \item Words, stems, tags, and word-classes of both head $h$ and child $m$.
+    \item Direction (left vs.\ right) and distance between the two words.
+    \item Counts of verbs, commas, and conjunctions located between $h$ and $m$.
+    \item Agreement between the proposed edge and the head-distance tagger.
 \end{itemize}
-Each parser trains for 12 epochs using \textbf{mistake-recovery training}: instead of always forcing the perfect training move, we let the parser follow its own chosen move (50\% of the time in epoch 0 and 90\% in epochs 1--11) and teach it whichever legal move loses the fewest remaining true edges from that state. This helps the parser keep going cleanly even after an early mistake. Right-to-left parsers run on reversed sentences with flipped tags and MST hints, then flip their predicted tree back.
 
-\paragraph{4-Seed Full-Tree Labeler.}
-Once the full tree is built, \texttt{FullTreeLabeler} scores relation labels for every edge $(h \to m)$ using full-sentence tree context: grandparent tags and UPOS, left and right siblings, whether head $h$ already has another subject or object child, preposition/mark/auxiliary/conjunction children, head word stats, relative-clause hints (\texttt{acl:relcl} vs.\ \texttt{acl}/\texttt{advcl}/\texttt{ccomp}), nearby punctuation, and child counts. Each of the 4 seeds trains for 6 epochs on a \textbf{70\% true trees / 30\% predicted MST trees mix} so it still predicts good labels when predicted heads have small mistakes.
+Given all pairwise scores, the best tree is found using the \textbf{Chu-Liu/Edmonds algorithm}. If the highest-scoring incoming edges create a cycle (for example, word A points to word B and word B points back to word A), the algorithm contracts the cycle into one node, finds the best incoming edge from the rest of the sentence, and expands the cycle back out. This guarantees one valid single-root tree rooted at token 0.
 
-\paragraph{Weighted Voting and 4 Cleanup Rules.}
-All 18 transition parsers vote on edges using their parser weight and score margin, along with votes from the 4-seed Graph-MST parser (top-3 heads plus margin bonus). Running Chu-Liu/Edmonds on the combined score matrix guarantees one valid single-root tree per sentence. Labels are then chosen by combining parser label votes (giving higher weight when the parser also picked the same head) and scores from the 4-seed \texttt{FullTreeLabeler}. Finally, we run four simple rules:
+On test data, score matrices from four random seeds are averaged. The MST parser outputs top-3 candidate heads and score margins for every word, which are used both as guide features for the transition parsers and as votes in the final tree selection.
+
+\subsection{18 Transition Parsers (3 Types)}
+A transition parser builds a tree step by step using a stack (words currently being processed) and a buffer (words waiting to be read). To get better accuracy and model diversity, we trained \textbf{18 parsers} split evenly across three parser types:
+\begin{itemize}[noitemsep]
+    \item \textbf{Arc-Hybrid (6 parsers: 4 left-to-right, 2 right-to-left):} Makes left arcs between the stack and buffer, and right arcs bottom-up on the stack.
+    \item \textbf{Arc-Eager (6 parsers: 4 left-to-right, 2 right-to-left):} Makes right-side attachments top-down using a \texttt{REDUCE} action and already-assigned parent features.
+    \item \textbf{Arc-Standard (6 parsers: 4 left-to-right, 2 right-to-left):} Strict bottom-up attachments between the top two stack words while looking ahead at the buffer.
+\end{itemize}
+
+\paragraph{Mistake-Recovery Training.}
+If a transition parser only trains on the perfect sequence of moves, even one wrong move at test time puts it into an unseen state and causes a chain of errors. Instead, during training our parsers follow their own predicted moves (50\% of the time in epoch 0 and 90\% in epochs 1--11). From whatever state the parser reaches, we compute the cost of each legal move (how many remaining gold edges it would lose) and update toward the lowest-cost move. This teaches each parser to keep going cleanly after an early mistake.
+
+\subsection{Full-Tree Relation Labeler (4 Seeds Averaged)}
+Once tree edges are decided, \texttt{FullTreeLabeler} scores the grammatical label for every edge $(h \to m)$ using the full sentence tree:
+\begin{itemize}[noitemsep]
+    \item The parent word, child word, and grandparent word ($g \to h \to m$).
+    \item Sibling words attached to the same parent on the left and right.
+    \item Prepositions, auxiliary verbs, and clause markers attached to the parent or child.
+    \item \textbf{Subject/Object Checks:} A verb normally should not have two separate subjects or conflicting direct objects. The labeler checks whether the parent already has another subject child on the left (\texttt{other\_left\_subj}) or another object child (\texttt{other\_obj\_left}, \texttt{other\_obj\_right}).
+\end{itemize}
+The labeler was trained across 4 random seeds on a mix of \textbf{70\% true trees and 30\% predicted MST trees}, so it still predicts accurate labels when predicted heads have small errors.
+
+\subsection{Ensemble Voting and Post-Processing Rules}
+All 18 transition parsers and the 4-seed Graph-MST parser vote on the best tree edges. Because 18 transition parsers would outweigh the single graph parser, both the MST score and the full-tree labeler score are scaled by $1.5\times$ ($18/12$) to keep a balanced weight. Chu-Liu/Edmonds is run on the combined vote matrix so every sentence gets one valid single-root tree.
+
+Labels are chosen by combining votes from the 18 parsers with scores from the 4-seed \texttt{FullTreeLabeler}. Finally, four simple cleanup rules are applied:
 \begin{enumerate}[noitemsep]
-    \item \texttt{punct}: learned punctuation words always get the \texttt{punct} label.
-    \item \texttt{flat}: keeps multi-word capitalized proper names connected with \texttt{flat}.
-    \item \texttt{passive}: changes \texttt{nsubj} to \texttt{nsubj:pass} when the head verb has an \texttt{aux:pass} child (and no \texttt{cop} or \texttt{obj}).
-    \item \texttt{obl\_nmod}: fixes \texttt{obl} vs.\ \texttt{nmod} and possessive \texttt{nmod:poss} using learned possessive words and whether the head is a noun or verb.
+    \item \texttt{punct}: Words identified as true punctuation are set to \texttt{punct}.
+    \item \texttt{flat}: Multi-word capitalized proper names (like person or place names) are kept connected with \texttt{flat}.
+    \item \texttt{passive}: Subjects of passive verbs (verbs with an \texttt{aux:pass} child) are changed from \texttt{nsubj} to \texttt{nsubj:pass}.
+    \item \texttt{obl\_nmod}: Prepositional phrases attached to verbs are set to \texttt{obl}, while those attached to nouns are set to \texttt{nmod} or possessive \texttt{nmod:poss}.
 \end{enumerate}
-We also wrote an optional logistic regression combiner in \texttt{combiner.py} (using Newton's method in \texttt{numpy}) for \texttt{--check} mode, while our final submission uses the direct weighted vote and cleanup rules.
 
 \section{Experiments and Results}
 
-\subsection{5-Fold CV Accuracy of Tagger Steps}
-Table~\ref{tab:cv} shows the 5-fold CV accuracy of our taggers on all 12,439 training sentences. Combining the left-to-right and right-to-left taggers in Step~3 improves accuracy from 84.98\% / 84.78\% to 85.34\%.
+\subsection{5-Fold CV Accuracy of Sequence Taggers}
+Table~\ref{tab:tagger_cv} shows the 5-fold cross-validation accuracy of the taggers across all 12,439 training sentences. Combining both reading directions in Step 3 clearly improves over single-direction tagging.
 
 \begin{table}[H]
 \centering
-\caption{5-fold CV accuracies on all 12,439 training sentences.}
-\label{tab:cv}
+\caption{5-fold cross-validation accuracy of sequence taggers on the training set.}
+\label{tab:tagger_cv}
 \begin{tabular}{@{}lc@{}}
 \toprule
-\textbf{Pipeline Step} & \textbf{5-Fold CV Accuracy} \\
+\textbf{Tagger Component} & \textbf{5-Fold CV Accuracy} \\
 \midrule
-Step 1: Word-Class Tagger (18 UPOS classes) & 94.79\% \\
-Step 2a: Left-to-Right Tagger & 84.98\% \\
-Step 2b: Right-to-Left Tagger & 84.78\% \\
+Step 1: Word-Class Tagger (18 Classes) & 94.79\% \\
+Step 2a: Left-to-Right Role Tagger & 84.98\% \\
+Step 2b: Right-to-Left Role Tagger & 84.78\% \\
 Step 3: Combined Both-Direction Tagger & 85.34\% \\
 Step 4: Head-Distance Tagger & 80.34\% \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Progress Across Iterations on Kaggle}
-Table~\ref{tab:kaggle} shows how our Kaggle Public Leaderboard score (LAS) improved across iterations.
+\subsection{Kaggle Score Progression Across Iterations}
+Table~\ref{tab:kaggle_progression} tracks our score progression across iterations on the Kaggle Public Leaderboard.
 
 \begin{table}[H]
 \centering
-\caption{Score progress across iterations on the Kaggle Public Leaderboard (LAS).}
-\label{tab:kaggle}
-\begin{tabular}{@{}cl>{\raggedright\arraybackslash}p{7.6cm}c@{}}
+\caption{Score progression across iterations on the Kaggle Public Leaderboard (LAS).}
+\label{tab:kaggle_progression}
+\begin{tabular}{@{}c>{\raggedright\arraybackslash}p{10.8cm}c@{}}
 \toprule
-\textbf{Iter.} & \textbf{Model} & \textbf{What We Changed} & \textbf{Public LAS} \\
+\textbf{Iter.} & \textbf{Configuration} & \textbf{Public LAS} \\
 \midrule
-1 & Baseline & 5 Arc-Hybrid parsers + simple vote & 0.7803 \\
-2 & + Second Pass & Added second-pass tagger, 7 parsers & 0.7811 \\
-3 & + Stats \& Tags & Both-direction taggers, word stats, head-distance tagger & 0.8038 \\
-4 & + Graph-MST & Added Graph-MST parser to guide transition parsers & 0.8119 \\
-5 & + 3 Parser Types & Added UPOS, 12 parsers (Hybrid/Eager/Standard), full-tree labeler, CLE vote & 0.8199 \\
-6 & + Learned Groups & Learned punct/standalone/possessive sets from train, apostrophe fix, 4 rules & 0.8255 \\
-7 & \emph{Experiment} & Variable step updates, beam-4 tagger, extra 2nd-order step, cluster templates \emph{(reverted)} & 0.8235 \\
-8 & + Multi-Seed & Reverted Iter.\ 7; 3-seed taggers/MST/labeler, 15 balanced parsers, extra labeler features & 0.8288 \\
-\textbf{9} & \textbf{Final Model} & \textbf{4-seed MST, 4-seed labeler, 18 parsers (6+6+6), balanced MST/labeler vote weights, extra labeler features} & \textbf{Final} \\
+1 & Baseline: 5 Arc-Hybrid models with simple majority vote & 0.7803 \\
+2 & Added second-pass forward syntactic tagger (7 parsers) & 0.7811 \\
+3 & Added bidirectional taggers, word stats, and head-distance tagger & 0.8038 \\
+4 & Added First-Order Graph-MST parser as a guide & 0.8119 \\
+5 & Added 18 UPOS classes, 12 parsers (3 types), full-tree labeler, and CLE voting & 0.8199 \\
+6 & Added learned punctuation/possessive sets, apostrophe fix, and 4 rules & 0.8255 \\
+7 & \emph{Experiment (reverted):} Variable step sizes, beam-4 tagger, 2nd-order search, clusters & 0.8235 \\
+8 & Reverted Iteration 7; 3-seed taggers/MST/labeler, 15 balanced parsers, better labeler & 0.8288 \\
+\textbf{9} & \textbf{Final Model: 4-seed MST, 4-seed labeler, 18 parsers (6+6+6), 1.5$\times$ vote scaling, margin bonus} & \textbf{0.8303} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Things We Tried That Did Not Work}
-In Iteration~7, our score went down from \texttt{0.8255} to \texttt{0.8235}. Checking why showed four problems:
+\subsection{Analysis of What Did Not Work (Iteration 7)}
+In Iteration 7, the score dropped from 0.8255 to 0.8235. Checking the errors showed four issues:
 \begin{enumerate}[noitemsep]
-    \item \textbf{Variable step-size updates:} Dividing perceptron updates by the number of active features made updates too small on rare words and shrank MST margins, breaking our \texttt{HIGH}/\texttt{MID}/\texttt{LOW} confidence thresholds. Going back to simple step-size 1 updates fixed this immediately.
-    \item \textbf{Beam-4 early stopping in taggers:} Stopping a sentence early when the true sequence dropped out of the top-4 beam skipped learning on the second half of long sentences.
-    \item \textbf{Extra second-order search step:} Running a separate greedy second-order scorer on top of the parser votes added noise and sometimes broke good agreed edges.
-    \item \textbf{Extra cluster features:} Adding large word-cluster templates into fixed-size hash tables caused more hash overlaps without helping accuracy.
+    \item \textbf{Variable Step Updates:} Dividing perceptron updates by the number of active features made updates on rare words too small, shrinking MST margins and breaking confidence thresholds. Fixed step sizes worked much better.
+    \item \textbf{Beam-4 Early Stopping in Taggers:} Stopping sequence updates early when the true tag sequence fell outside the top 4 candidates skipped training on the second half of long sentences.
+    \item \textbf{Greedy Second-Order Reranking:} Running an extra greedy search step on top of the parser votes added noise and sometimes broke good agreed edges.
+    \item \textbf{Large Word-Cluster Features:} Adding large word-cluster templates into fixed-size hash tables caused more hash collisions without adding useful signal.
 \end{enumerate}
-Removing those changes and using \textbf{multi-seed averaging}, \textbf{balanced 3-type parser ensembles}, and \textbf{better full-tree labeler features} raised our score from \texttt{0.8255} to \texttt{0.8288} and our final selected model.
+Reverting these four changes and focusing on multi-seed averaging, 18-parser diversity, and better full-tree labeler features lifted the score up to our final public score of \textbf{0.8303180}.
 
 \section{How to Run}
 
 \begin{enumerate}[noitemsep]
-    \item Put \texttt{train.csv}, \texttt{test.csv}, and \texttt{sample.csv} inside \texttt{data/}.
-    \item Install \texttt{numpy}: \texttt{pip install numpy}.
-    \item Run \texttt{python3 -u train\_and\_predict.py}.
+    \item Put \texttt{train.csv}, \texttt{test.csv}, and \texttt{sample.csv} inside the \texttt{data/} folder.
+    \item Install \texttt{numpy} (Python 3.8+): \texttt{pip install numpy}.
+    \item Run full training and test prediction:
+    \begin{verbatim}
+    python3 -u train_and_predict.py
+    \end{verbatim}
+    Predictions are written to \texttt{outputs/submission.csv} (the script sets \texttt{PYTHONHASHSEED=0} and fixed seeds at startup).
 \end{enumerate}
-Final predictions are written to \texttt{outputs/submission.csv} with fixed seeds and \texttt{PYTHONHASHSEED=0}.
 
 \section{Team Member Contributions}
+
+Both team members contributed equally across the project, as listed in Table~\ref{tab:contributions}.
+
 \begin{table}[H]
 \centering
-\begin{tabular}{@{}p{4.0cm}>{\raggedright\arraybackslash}p{11.0cm}@{}}
+\caption{Division of project work and contributions.}
+\label{tab:contributions}
+\begin{tabular}{@{}p{4.1cm}>{\raggedright\arraybackslash}p{10.9cm}@{}}
 \toprule
-\textbf{Team Member} & \textbf{Work Done} \\
+\textbf{Member} & \textbf{Work Done} \\
 \midrule
 \textbf{Murthy Manideep} \newline (\texttt{CS24BTECH11039}) &
-Data reading and word cleaning, word stats table and learned word sets, averaged perceptron, all 5 sequence taggers (UPOS, left-to-right, right-to-left, combined, head-distance), Graph-MST parser with Chu-Liu/Edmonds tree builder, error analysis, and model training runs. \\[0.6em]
+\begin{itemize}[noitemsep,topsep=0pt,partopsep=0pt,leftmargin=*,before=\vspace{-0.5\baselineskip},after=\vspace{-\baselineskip}]
+    \item Data loading, text cleaning, apostrophe normalization, and placeholder tokens in \texttt{data\_utils.py}.
+    \item Learning punctuation, standalone words, and possessive marker sets from training trees.
+    \item Multi-class averaged perceptron with feature hashing in \texttt{perceptron.py}.
+    \item Design and training of the five sequence taggers (UPOS, forward, backward, combined, head-distance) in \texttt{tagger.py}.
+    \item First-order Graph-MST parser with 42 NumPy feature templates and Chu-Liu/Edmonds tree builder in \texttt{parser.py}.
+    \item 5-fold cross-validation pipeline and training runs.
+\end{itemize} \\
+\midrule
 \textbf{Adinesh Reddy} \newline (\texttt{CS24BTECH11026}) &
-All 3 transition parser types (Arc-Hybrid, Arc-Eager, Arc-Standard) with mistake-recovery training, right-to-left sentence flipping, 4-seed full-tree labeler and features, ensemble voting, 4 post-processing rules, 90/10 block validation checks, and report/README writing. \\
+\begin{itemize}[noitemsep,topsep=0pt,partopsep=0pt,leftmargin=*,before=\vspace{-0.5\baselineskip},after=\vspace{-\baselineskip}]
+    \item Implementation of the three transition parser types (Arc-Hybrid, Arc-Eager, Arc-Standard) with mistake-recovery training in \texttt{parser.py}.
+    \item Sentence reversal helpers for right-to-left parsing and flipping outputs back.
+    \item Full-Tree Relation Labeler with subject/object checks (\texttt{other\_left\_subj}, \texttt{other\_obj\_left}, \texttt{other\_obj\_right}).
+    \item Ensemble voting with Chu-Liu/Edmonds decoding and $1.5\times$ MST/labeler scaling in \texttt{train\_and\_predict.py}.
+    \item Implementation of the four post-processing rules (\texttt{punct}, \texttt{flat}, \texttt{passive}, \texttt{obl\_nmod}).
+    \item Block validation experiments, error analysis, and report/README writing.
+\end{itemize} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \section{Conclusion}
 
-Overall, simple linear structured models with careful feature engineering worked very well for dependency parsing. The biggest gains came from avoiding overfitting with 5-fold CV inside the pipeline, combining a global Chu-Liu/Edmonds MST parser with 18 transition parsers across three systems and both directions, training the full-tree labeler on a mix of true and predicted trees, and learning punctuation and possessive word sets directly from \texttt{train.csv}.
+Overall, traditional linear structured models paired with careful feature engineering achieved strong dependency parsing results on raw text. Combining five cross-validated sequence taggers, a 4-seed Graph-MST parser, an 18-parser transition ensemble with mistake-recovery training, and a 4-seed full-tree labeler reached a final Kaggle public score of \textbf{0.8303180}.
 
 \end{document}

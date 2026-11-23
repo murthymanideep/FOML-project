@@ -787,7 +787,7 @@ def distance_text(a, b):
 
 
 def move_costs(state, gold_heads, gold_children):
-    # dynamic oracle costs for arc-hybrid
+    # move costs for arc-hybrid
     s0 = state.stack_word(0)
     s1 = state.stack_word(1)
     b0 = state.buffer_word(0)
@@ -1205,7 +1205,7 @@ def get_parser_features(ctx, state):
         "s1t+s0_case+s0w=" + s1t + "+" + s0_case + "+" + s0w,
         "n0w+s0_case=" + n0w + "+" + s0_case + "+" + s0cg,
         "n0st+s0_case=" + n0st + "+" + s0_case + "+" + s0cg,
-        "n0u+s0_case=" + n0u + "+" + s0_case + "+" + n0u,
+        "n0u+s0_case=" + n0u + "+" + s0_case + "+" + s0u,
         "n0t+s0_case=" + n0t + "+" + s0_case + "+" + s0t,
         "s0w+n0_case=" + s0w + "+" + n0_case + "+" + n0cg,
         "s0st+n0_case=" + s0st + "+" + n0_case + "+" + n0cg,
@@ -1526,7 +1526,7 @@ class ArcEagerState(ParserState):
 
 
 def eager_move_costs(state, gold_heads, gold_children):
-    # dynamic oracle costs for arc-eager
+    # move costs for arc-eager
     s0 = state.stack_word(0)
     b0 = state.buffer_word(0)
     stack_set = set(state.stack)
@@ -1842,7 +1842,7 @@ class ArcStandardState(ParserState):
 
 
 def standard_move_costs(state, gold_heads, gold_children):
-    # dynamic oracle costs for arc-standard
+    # move costs for arc-standard
     s0 = state.stack_word(0)
     s1 = state.stack_word(1)
     stack_set = set(state.stack)

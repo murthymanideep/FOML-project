@@ -19,7 +19,6 @@ Predictions are written as `HEAD|LABEL` (for example `3|det`). A word is counted
 | `data_utils.py` | Reads CSV files, writes submission, checks UAS/LAS accuracy, cleans words, builds word stats, and finds punctuation/pronoun/possessive words from `train.csv`. |
 | `tagger.py` | Builds 18 word-class tags (UPOS) and runs 5 taggers (word class, left-to-right, right-to-left, combined tagger, and head-distance tagger) with 5-fold CV and 3 seeds. |
 | `parser.py` | Has the Chu-Liu/Edmonds tree builder, the 42-feature graph MST parser, 3 transition parsers (`Arc-Hybrid`, `Arc-Eager`, `Arc-Standard`), and the full-tree labeler. |
-| `combiner.py` | Optional logistic regression combiner for `--check` mode. |
 | `report.tex` / `report.pdf` | Our project report. |
 
 ---
@@ -36,19 +35,13 @@ Predictions are written as `HEAD|LABEL` (for example `3|det`). A word is counted
    pip install numpy
    ```
 
-3. **Run the full code to make our final submission (`outputs/submission.csv`):**
+3. **Run the script to generate `outputs/submission.csv`:**
    ```bash
    python3 -u train_and_predict.py
    ```
    This trains on all 12,439 sentences in `data/train.csv`, predicts all 2,077 sentences in `data/test.csv`, combines all parsers by weighted voting + Chu-Liu/Edmonds + 4 cleanup rules, and saves `outputs/submission.csv`.
 
    The script sets `PYTHONHASHSEED=0` and fixed seeds, and saves `outputs/submission.csv`.
-
-4. **Optional local check (90/10 validation split):**
-   ```bash
-   python3 -u train_and_predict.py --check
-   ```
-   This keeps every 10th block of 100 sentences (10%) as validation data, prints the accuracy of each stage and parser, and prints a summary of common errors.
 
 ---
 
@@ -77,4 +70,4 @@ Predictions are written as `HEAD|LABEL` (for example `3|det`). A word is counted
 | + Learned Word Groups | Learned punct/pronoun/possessive words from train, apostrophe fix, 4 rules | `0.8255` |
 | Experiment *(reverted)* | Variable step updates, beam-4 tagger, extra 2nd-order step, extra cluster features | `0.8235` |
 | + Multi-Seed & 15 Parsers | Went back to simple updates, 3-seed taggers/MST/labeler, 15 parsers, better labeler features | `0.8288` |
-| **Final Model** | **4-seed MST, 4-seed labeler, 18 parsers (6+6+6), balanced vote weights, extra labeler features** | **Final** |
+| **Final Model** | **4-seed MST, 4-seed labeler, 18 parsers (6+6+6), balanced vote weights, extra labeler features** | **`0.8303`** |

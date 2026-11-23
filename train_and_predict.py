@@ -1,18 +1,14 @@
 # main script to train the dependency parsers and create outputs/submission.csv
-# run python train_and_predict.py --check for 90/10 val check
-# run python train_and_predict.py to train on full train.csv and predict test.csv
+# run python3 -u train_and_predict.py to train on train.csv and predict test.csv
 
 import gc
-import json
 import math
 import os
 import random
-import sys
 import time
 
 import numpy as np
 
-import combiner
 from data_utils import (
     accuracy,
     build_lexicon,
@@ -52,7 +48,6 @@ from tagger import (
 # settings
 DATA_FOLDER = "data"
 OUTPUT_FOLDER = "outputs"
-BEST_SETTINGS = "best_settings.json"
 
 UPOS_EPOCHS = 6
 TAGGER_EPOCHS = 6
@@ -64,11 +59,6 @@ TREE_LABELER_EPOCHS = 6
 TREE_LABELER_SEEDS = 4
 CV_FOLDS = 5
 PARSER_EPOCHS = 12
-
-# val split: keep every 10th block of 100 sentences (10% val)
-CHECK_GROUP_SIZE = 100
-COMBINER_MIN_GAIN = 0.10
-L2_GRID = [1.0, 5.0, 15.0]
 
 # 18 parsers: 6 arc-hybrid, 6 arc-eager, 6 arc-standard (both directions)
 # format: (parser_type, direction, seed, weight)
@@ -99,15 +89,6 @@ DEFAULT_RULES = {
     "passive": True,
     "obl_nmod": True,
 }
-
-RULE_VARIANTS = [
-    ("no rules",         {"punct": False, "flat": False, "passive": False, "obl_nmod": False}),
-    ("punct only",       {"punct": True,  "flat": False, "passive": False, "obl_nmod": False}),
-    ("punct + flat",     {"punct": True,  "flat": True,  "passive": False, "obl_nmod": False}),
-    ("punct + passive",  {"punct": True,  "flat": False, "passive": True,  "obl_nmod": False}),
-    ("punct + obl_nmod", {"punct": True,  "flat": False, "passive": False, "obl_nmod": True}),
-    ("all rules",        {"punct": True,  "flat": True,  "passive": True,  "obl_nmod": True}),
-]
 
 
 def get_label_names(sentences):
@@ -586,50 +567,13 @@ def finish_trees(outputs, heads, labels, rules):
     )
 
 
-def print_error_report(sentences, heads, labels):
-    total = wrong_head = wrong_label = 0
-    label_total = {}
-    label_wrong = {}
-    mix_ups = {}
-    for k in range(len(sentences)):
-        for i in range(1, len(sentences[k]["words"])):
-            gh = sentences[k]["heads"][i]
-            gl = sentences[k]["labels"][i]
-            total += 1
-            label_total[gl] = label_total.get(gl, 0) + 1
-            if heads[k][i] != gh:
-                wrong_head += 1
-                label_wrong[gl] = label_wrong.get(gl, 0) + 1
-            elif labels[k][i] != gl:
-                wrong_label += 1
-                label_wrong[gl] = label_wrong.get(gl, 0) + 1
-                pair = gl + " -> " + labels[k][i]
-                mix_ups[pair] = mix_ups.get(pair, 0) + 1
-
-    print("\nError summary (%d tokens):" % total)
-    print("  wrong head:               %5d (%.2f%%)" % (wrong_head, 100.0 * wrong_head / total))
-    print("  right head, wrong label:  %5d (%.2f%%)" % (wrong_label, 100.0 * wrong_label / total))
-    print("  top error labels:")
-    for (cnt, lab) in sorted(((c, l) for l, c in label_wrong.items()), reverse=True)[:12]:
-        print("    %-15s %5d / %5d  (-%.2f%%)" % (lab, cnt, label_total[lab], 100.0 * cnt / total))
-    print("  common label mistakes (true -> pred):")
-    for (cnt, pair) in sorted(((c, p) for p, c in mix_ups.items()), reverse=True)[:10]:
-        print("    %-30s %5d" % (pair, cnt))
-
-
-def run_pipeline(train_sentences, eval_sentences, is_val=False):
+def run_pipeline(train_sentences, eval_sentences):
     label_names = get_label_names(train_sentences)
     punct_forms = find_punct_forms(train_sentences)
 
     train_tags, eval_tags, train_supertags, eval_supertags, train_upos, eval_upos = make_tags(
         train_sentences, eval_sentences
     )
-    if is_val:
-        print("  val upos: %.2f%% | tag: %.2f%% | supertag: %.2f%%" % (
-            tag_accuracy(make_upos_targets(eval_sentences), eval_upos),
-            tag_accuracy(make_tag_targets(eval_sentences), eval_tags),
-            tag_accuracy(make_supertag_targets(eval_sentences), eval_supertags),
-        ))
 
     tag_targets_ltr = make_tag_targets(train_sentences)
     lexicon_ltr = build_lexicon(tag_targets_ltr)
@@ -643,10 +587,6 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
         eval_sentences, eval_tags, eval_supertags, eval_upos,
         lexicon_ltr,
     )
-    if is_val:
-        dummy = [["root"] * len(s["words"]) for s in eval_sentences]
-        mst_uas, _ = accuracy(eval_sentences, [m["heads"] for m in eval_mst], dummy)
-        print("  val %d-seed mst uas: %.2f%%" % (MST_SEEDS, mst_uas))
 
     print("Step 6/6: training %d-seed tree labeler and %d parsers..."
           % (TREE_LABELER_SEEDS, len(PARSERS)))
@@ -671,13 +611,8 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
         predictions.append(res)
         weights.append(weight)
         gc.collect()
-        if is_val:
-            uas, las = accuracy(eval_sentences, res[0], res[1])
-            print("  [%2d/%d] %-12s %-13s seed=%d -> uas %.2f  las %.2f"
-                  % (idx, len(PARSERS), system_type, direction, seed, uas, las))
-        else:
-            print("  [%2d/%d] %-12s %-13s seed=%d done"
-                  % (idx, len(PARSERS), system_type, direction, seed))
+        print("  [%2d/%d] %-12s %-13s seed=%d done"
+              % (idx, len(PARSERS), system_type, direction, seed))
 
     return {
         "sentences": eval_sentences,
@@ -695,109 +630,10 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
     }
 
 
-def tune_on_validation(outputs):
-    # check rules and combiner on 10% val set and save best_settings.json
-    sentences = outputs["sentences"]
-    voted_heads, voted_labels = vote(outputs)
-    base_uas, base_las = accuracy(sentences, voted_heads, voted_labels)
-    print("\nVote before rules: uas %.2f  las %.2f" % (base_uas, base_las))
-
-    # test post-processing rules
-    print("\nChecking rules on val:")
-    best_rules = DEFAULT_RULES
-    best_rules_las = -1.0
-    best_rule_name = ""
-    for (name, rules) in RULE_VARIANTS:
-        fh, fl = finish_trees(outputs, voted_heads, voted_labels, rules)
-        uas, las = accuracy(sentences, fh, fl)
-        print("  %-18s -> uas %.2f  las %.2f" % (name, uas, las))
-        if las > best_rules_las:
-            best_rules_las = las
-            best_rules = rules
-            best_rule_name = name
-    print("  best rules: %s" % best_rule_name)
-
-    hand_heads, hand_labels = finish_trees(outputs, voted_heads, voted_labels, best_rules)
-    hand_uas, hand_las = accuracy(sentences, hand_heads, hand_labels)
-
-    # try softmax combiner with 2-fold cv on val
-    print("\nChecking combiner l2 values on val:")
-    best_l2 = 5.0
-    best_comb_las = -1.0
-    best_comb_trees = None
-    for l2 in L2_GRID:
-        ch, cl = combiner.cross_validate(outputs, l2=l2)
-        ch, cl = finish_trees(outputs, ch, cl, best_rules)
-        uas, las = accuracy(sentences, ch, cl)
-        print("  l2=%-4.1f -> uas %.2f  las %.2f" % (l2, uas, las))
-        if las > best_comb_las:
-            best_comb_las = las
-            best_l2 = l2
-            best_comb_trees = (ch, cl)
-
-    use_combiner = best_comb_las >= hand_las + COMBINER_MIN_GAIN
-    print("\nVal results:")
-    print("  normal vote:               uas %.2f  las %.2f" % (hand_uas, hand_las))
-    print("  softmax combiner (l2=%.1f): las %.2f" % (best_l2, best_comb_las))
-    if use_combiner:
-        print("  picked: softmax combiner (+%.2f las)" % (best_comb_las - hand_las))
-        print_error_report(sentences, best_comb_trees[0], best_comb_trees[1])
-    else:
-        print("  picked: normal vote")
-        print_error_report(sentences, hand_heads, hand_labels)
-
-    model = combiner.train_combiner(outputs, list(range(len(sentences))), l2=best_l2)
-    settings = {
-        "rules": best_rules,
-        "use_combiner": bool(use_combiner),
-        "combiner_l2": best_l2,
-        "normal_vote_las": round(hand_las, 2),
-        "combiner_las": round(best_comb_las, 2),
-        "combiner": {
-            "arc_weights": [float(x) for x in model["arc_weights"]],
-            "label_weights": [float(x) for x in model["label_weights"]],
-            "parsers": [list(p) for p in model["parsers"]],
-            "uses_mst": bool(model["uses_mst"]),
-            "uses_labeler": bool(model["uses_labeler"]),
-        },
-    }
-    with open(BEST_SETTINGS, "w", encoding="utf-8") as f:
-        json.dump(settings, f, indent=1)
-    print("\nSaved settings to %s" % BEST_SETTINGS)
-
-
 def decode_final_trees(outputs):
-    rules = DEFAULT_RULES
-    model = None
-
-    if os.path.exists(BEST_SETTINGS):
-        with open(BEST_SETTINGS, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-        rules = settings.get("rules", DEFAULT_RULES)
-        if settings.get("use_combiner"):
-            saved = settings["combiner"]
-            same_parsers = saved["parsers"] == [list(p) for p in outputs["parsers"]]
-            same_mst = saved["uses_mst"] == (outputs["mst"] is not None)
-            same_labeler = saved["uses_labeler"] == (outputs["tree_labeler"] is not None)
-            if same_parsers and same_mst and same_labeler:
-                model = {
-                    "arc_weights": np.array(saved["arc_weights"]),
-                    "label_weights": np.array(saved["label_weights"]),
-                }
-        print("Using settings from %s" % BEST_SETTINGS)
-    else:
-        print("No %s found, using default vote and rules" % BEST_SETTINGS)
-
-    if model is not None:
-        print("Combining test trees with softmax combiner...")
-        pred_heads, pred_labels = combiner.combine(outputs, model)
-        heads = [pred_heads[k] for k in range(len(outputs["sentences"]))]
-        labels = [pred_labels[k] for k in range(len(outputs["sentences"]))]
-    else:
-        print("Combining test trees with normal vote...")
-        heads, labels = vote(outputs)
-
-    return finish_trees(outputs, heads, labels, rules)
+    print("Combining test trees with weighted vote...")
+    heads, labels = vote(outputs)
+    return finish_trees(outputs, heads, labels, DEFAULT_RULES)
 
 
 def write_final_submission(test_sentences, test_heads, test_labels, train_sentences):
@@ -820,35 +656,15 @@ def write_final_submission(test_sentences, test_heads, test_labels, train_senten
     print("Saved %d predictions to %s" % (len(sample_ids), output_path))
 
 
-def check_mode(all_train):
-    train_sentences = []
-    val_sentences = []
-    for k, sentence in enumerate(all_train):
-        if (k // CHECK_GROUP_SIZE) % 10 == 0:
-            val_sentences.append(sentence)
-        else:
-            train_sentences.append(sentence)
-    print("Val mode: %d train / %d val sentences" % (len(train_sentences), len(val_sentences)))
-    outputs = run_pipeline(train_sentences, val_sentences, is_val=True)
-    tune_on_validation(outputs)
-
-
-def final_mode(train_sentences):
-    test_sentences = read_sentences(os.path.join(DATA_FOLDER, "test.csv"))
-    print("Final mode: %d train / %d test sentences" % (len(train_sentences), len(test_sentences)))
-    outputs = run_pipeline(train_sentences, test_sentences, is_val=False)
-    test_heads, test_labels = decode_final_trees(outputs)
-    write_final_submission(test_sentences, test_heads, test_labels, train_sentences)
-
-
 def main():
     fix_hash_seed()
     start_time = time.time()
     train_sentences = read_sentences(os.path.join(DATA_FOLDER, "train.csv"))
-    if "--check" in sys.argv:
-        check_mode(train_sentences)
-    else:
-        final_mode(train_sentences)
+    test_sentences = read_sentences(os.path.join(DATA_FOLDER, "test.csv"))
+    print("Training on %d train / predicting %d test sentences" % (len(train_sentences), len(test_sentences)))
+    outputs = run_pipeline(train_sentences, test_sentences)
+    test_heads, test_labels = decode_final_trees(outputs)
+    write_final_submission(test_sentences, test_heads, test_labels, train_sentences)
     print("Done in %.1f minutes" % ((time.time() - start_time) / 60.0))
 
 
