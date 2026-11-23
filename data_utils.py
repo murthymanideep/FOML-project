@@ -1,19 +1,5 @@
-"""
-Helper functions for reading the data, writing the submission file,
-measuring accuracy, and extracting morphological/lexical word properties.
-
-A sentence is stored as a dictionary with these keys:
-
-    "name"    : the sentence id, for example "train_000001"
-    "row_ids" : the ID column of each word (list of strings)
-    "words"   : the words of the sentence
-    "heads"   : the correct head of each word   (only for training data)
-    "labels"  : the correct relation of each word (only for training data)
-
-IMPORTANT: position 0 of "words", "heads" and "labels" is a fake word called
-"<ROOT>". The real words start at position 1. This way the word at position i
-has token_id i, and a head of 0 means "the root", exactly like in the data.
-"""
+# helper functions for reading csv files, saving submission, and word features
+# position 0 in every sentence is <ROOT>, real words start at index 1
 
 import csv
 import os
@@ -22,9 +8,7 @@ import sys
 
 ROOT_WORD = "<ROOT>"
 
-# Groups of relation labels (these label names come from the training data).
-# They are used to LEARN word groups from the training trees, so the code
-# needs no hand-written lists of English words.
+# relation label sets used to find standalone and modifier words from train data
 NOMINAL_LABELS = {
     "nsubj", "nsubj:pass", "nsubj:outer", "obj", "iobj", "obl", "obl:unmarked",
     "obl:agent", "nmod", "nmod:poss", "nmod:unmarked", "nmod:desc", "expl",
@@ -36,7 +20,6 @@ MODIFIER_LABELS = {
 
 
 def is_punct_word(word):
-    """Return True if the token is purely punctuation or an empty quote token."""
     if word == ROOT_WORD:
         return False
     if word == "":
@@ -48,16 +31,7 @@ def is_punct_word(word):
 
 
 def find_punct_forms(sentences, min_share=0.98, min_count=3):
-    """
-    Return the set of word forms that the training data labels "punct"
-    almost always (in at least `min_share` of the cases, and seen at least
-    `min_count` times).
-
-    We cannot decide this from the characters alone: in this data "&" is
-    "cc", "$" heads the number after it, "%" is a noun and ":)" is
-    "discourse". Only these forms may be forced to "punct" or blocked from
-    being a head.
-    """
+    # find tokens that are labeled punct almost every time in train data
     total = {}
     punct = {}
     for sentence in sentences:
@@ -74,14 +48,8 @@ def find_punct_forms(sentences, min_share=0.98, min_count=3):
     return forms
 
 
-def make_hashing_repeatable():
-    """
-    The perceptrons use Python's hash() to find the table row of a feature.
-    Python gives different hash numbers in every run unless the setting
-    PYTHONHASHSEED is fixed, so two runs of the same code gave slightly
-    different models. If the setting is not 0, start this same script again
-    with PYTHONHASHSEED=0. Call this before anything else.
-    """
+def fix_hash_seed():
+    # fix PYTHONHASHSEED=0 so python hash() gives same numbers every run
     if os.environ.get("PYTHONHASHSEED") != "0":
         os.environ["PYTHONHASHSEED"] = "0"
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -98,7 +66,7 @@ def make_empty_sentence(name):
 
 
 def read_sentences(file_path):
-    """Read train.csv or test.csv and group the rows into sentences."""
+    # read train.csv or test.csv and group tokens by sentence_id
     sentences = []
     current_sentence = None
 
@@ -125,7 +93,6 @@ def read_sentences(file_path):
 
 
 def read_sample_ids(file_path):
-    """Return the list of IDs (in order) and the column names of the sample file."""
     ids = []
     with open(file_path, newline="", encoding="utf-8") as csv_file:
         reader = csv.reader(csv_file)
@@ -135,23 +102,16 @@ def read_sample_ids(file_path):
     return ids, header
 
 
-def write_submission(file_path, header, ids, answer_of_id):
-    """Write one line "ID,HEAD|LABEL" for every ID, in the given order."""
+def write_submission(file_path, header, ids, pred_map):
     with open(file_path, "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow(header)
         for row_id in ids:
-            writer.writerow([row_id, answer_of_id[row_id]])
+            writer.writerow([row_id, pred_map[row_id]])
 
 
 def accuracy(sentences, predicted_heads, predicted_labels):
-    """
-    Return (UAS, LAS) as percentages.
-
-    UAS = share of words with the correct head.
-    LAS = share of words with the correct head AND the correct label.
-          LAS is the score used in the competition.
-    """
+    # calculate UAS (head accuracy) and LAS (head + label accuracy)
     total = 0
     head_correct = 0
     both_correct = 0
@@ -169,16 +129,7 @@ def accuracy(sentences, predicted_heads, predicted_labels):
 
 
 def normalize_word(word):
-    """
-    Lower-case a word, remove apostrophes, and replace numbers, years,
-    percentages, amounts of money, times, URLs and e-mail addresses by a
-    common symbol.
-
-    Why remove apostrophes: in this data most apostrophes were already
-    removed ("Bing s rush", "we ve"), but a few are still there ("n't",
-    "’s"). Removing all of them makes both spellings the same word, so they
-    share what the models learn about them.
-    """
+    # lowercase word, remove apostrophes, and group numbers/urls/emails/etc
     if word == ROOT_WORD:
         return word
     if word == "":
@@ -215,23 +166,14 @@ STEM_LENGTH = 5
 
 
 def stem_word(norm_word):
-    """
-    A very simple stem that needs no knowledge of English: the first
-    STEM_LENGTH letters of the word. Words that start the same way usually
-    belong together ("computer", "computers" -> "compu"; "policy",
-    "policies" -> "polic"), so they can share their statistics.
-    Short words, numbers and special symbols stay as they are.
-    """
+    # take first 5 letters as a simple stem
     if len(norm_word) <= STEM_LENGTH or norm_word[0] == "<" or not norm_word.isalpha():
         return norm_word
     return norm_word[:STEM_LENGTH]
 
 
 def word_shape(word):
-    """
-    Describe how a word looks: upper case -> X, lower case -> x, digit -> d,
-    other characters stay the same. Repeated symbols are written once.
-    """
+    # convert chars to X (upper), x (lower), d (digit) and collapse repeats
     if word == "":
         return "'"
     shape = ""
@@ -250,18 +192,7 @@ def word_shape(word):
 
 
 def word_signature(word, position=1):
-    """
-    How a word looks, for rare or unseen words. Uses only the characters,
-    no knowledge of English:
-      * capital letters: ALL_CAP ("NASA"), INIT_CAP (capital, first word of
-        the sentence), MID_CAP (capital, later in the sentence - often a
-        name), MIX_CAP ("iPhone"), LOW (no capitals)
-      * digits (DIG) and hyphens (HYP)
-      * the last 3 letters ("END_ion", "END_ing", ...) for words of 4 or more
-        letters, otherwise the length ("LEN_2"). The models learn from the
-        training data what each ending usually means.
-    Example: "Mississauga" (not first word) -> "MID_CAP|||END_uga"
-    """
+    # char pattern for rare or unseen words (caps, digits, hyphen, suffix)
     if word == ROOT_WORD:
         return "ROOT"
     if word == "" or is_punct_word(word):
@@ -306,17 +237,8 @@ def word_signature(word, position=1):
     return cap + "|" + has_digit + "|" + has_hyphen + "|" + ending
 
 
-def find_standalone_nominals(sentences, min_count=10):
-    """
-    LEARN "pronoun-like" words from the training trees: frequent words that
-    are mostly used as a nominal (subject, object, possessor, ...) but almost
-    never get a determiner, adjective, compound, number or name-part child.
-
-    From this data it learns words like "he", "it", "you", "my", "who",
-    "themselves", but also some frequent names ("london", "nasa") and words
-    like "today": they all stand alone in a sentence in the same way.
-    No hand-made list of English words is used.
-    """
+def get_standalone_words(sentences, min_count=10):
+    # find pronoun-like words from train data that rarely take modifiers
     count = {}
     as_nominal = {}
     with_modifier = {}
@@ -346,12 +268,8 @@ def find_standalone_nominals(sentences, min_count=10):
     return words
 
 
-def find_possessive_markers(sentences, min_count=5):
-    """
-    LEARN the possessive markers from the training trees: words labelled
-    "case" whose head is almost always labelled "nmod:poss" (in this data
-    the possessive "s" and the empty apostrophe token).
-    """
+def get_possessive_words(sentences, min_count=5):
+    # find case tokens whose head is usually nmod:poss
     as_case = {}
     as_possessive = {}
     for sentence in sentences:
@@ -372,7 +290,7 @@ def find_possessive_markers(sentences, min_count=5):
 
 
 def base_label(tag_or_label):
-    """Strip direction markers (< or >) and UD subtypes (:pass, :poss, etc.)."""
+    # remove < or > and :subtypes from a tag/label
     if not tag_or_label or tag_or_label in (ROOT_WORD, "<NONE>", "<START>", "<END>"):
         return tag_or_label
     clean = tag_or_label.rstrip("<>")
@@ -380,7 +298,6 @@ def base_label(tag_or_label):
 
 
 def tag_direction(tag):
-    """Return '<', '>', or '0' from a directional tag."""
     if not tag:
         return "0"
     if tag[-1] == "<":
@@ -391,7 +308,7 @@ def tag_direction(tag):
 
 
 def coarse_group(tag_or_label):
-    """Map a UD relation or directional tag into a compact syntactic family."""
+    # group detailed labels into broader categories
     b = base_label(tag_or_label)
     if b in ("nsubj", "csubj"):
         return "SUBJ"
@@ -419,7 +336,7 @@ def coarse_group(tag_or_label):
 
 
 def head_offset_bucket(index, head):
-    """Signed relative distance bucket from token index to its head."""
+    # bucketed signed distance from word to its head
     if head == 0:
         return "ROOT"
     diff = head - index
@@ -441,11 +358,7 @@ def head_offset_bucket(index, head):
 
 
 def build_lexicon(sentences):
-    """
-    Build an empirical word, stem, & morphological signature lexicon from
-    training sentences. Also captures left/right neighbor tag context to form
-    distributional clusters.
-    """
+    # collect word, stem, signature, and neighbor tag stats from train sentences
     word_tag_counts = {}
     stem_tag_counts = {}
     sig_tag_counts = {}
@@ -558,12 +471,8 @@ def build_lexicon(sentences):
     }
 
 
-def lookup_word_priors(lexicon, raw_word, normal_word, position):
-    """
-    Return (prior_tag, ambig_class, coarse_tag, cluster_id, freq_bucket)
-    for a word using the training lexicon, with morphological stem and
-    signature fallback for rare/unseen words.
-    """
+def get_word_info(lexicon, raw_word, normal_word, position):
+    # look up most common tag, top-2 tags, group, cluster, and freq bucket for a word
     if raw_word == ROOT_WORD:
         return (ROOT_WORD, ROOT_WORD, ROOT_WORD, "ROOT", "HIGH")
 
@@ -585,7 +494,7 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
             fb = "LOW"
         return (dom, amb, crs, clu, fb)
 
-    # Fallback 1: check morphological stem if the word is not a mid-sentence proper noun
+    # try stem if word is rare/unseen
     st = stem_word(normal_word)
     st_total = lexicon.get("stem_totals", {}).get(st, 0)
     if st != normal_word and st_total >= 4 and not sig.startswith("MID_CAP"):
@@ -596,7 +505,7 @@ def lookup_word_priors(lexicon, raw_word, normal_word, position):
         fb = "STEM_SINGLE" if total == 1 else "STEM_OOV"
         return (dom, amb, crs, clu, fb)
 
-    # Fallback 2: morphological signature
+    # last fallback: use char signature
     dom = lexicon["sig_dominant"].get(sig, "UNK")
     amb = lexicon["sig_ambiguity"].get(sig, "UNK")
     crs = coarse_group(dom) if dom != "UNK" else "UNK"

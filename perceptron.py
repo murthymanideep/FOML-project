@@ -1,6 +1,4 @@
-"""
-Multi-class averaged perceptron with bitmasked feature hashing.
-"""
+# simple averaged perceptron using feature hashing
 
 import numpy as np
 
@@ -17,7 +15,7 @@ class AveragedPerceptron:
         self.is_averaged = False
 
     def feature_rows(self, features):
-        """Map feature strings to row indices in the weight table."""
+        # hash each feature string to a row in the weight table
         mask = self.mask
         if mask is not None:
             return np.fromiter((hash(f) & mask for f in features), dtype=np.int32, count=len(features))
@@ -25,14 +23,12 @@ class AveragedPerceptron:
         return np.fromiter((hash(f) % n_rows for f in features), dtype=np.int32, count=len(features))
 
     def scores(self, rows, use_average=False):
-        """Return the score vector for all classes."""
         if use_average and not self.is_averaged:
             table = self.weights[rows] - self.totals[rows] * (1.0 / self.step)
             return table.sum(axis=0)
         return self.weights[rows].sum(axis=0)
 
     def update(self, rows, correct_class, predicted_class, scale=1.0):
-        """Reward the correct class and penalize the predicted class."""
         if correct_class == predicted_class:
             return
         step_scale = np.float32(scale * self.step)
@@ -43,11 +39,10 @@ class AveragedPerceptron:
         self.totals[rows, predicted_class] -= step_scale
 
     def next_step(self):
-        """Advance the step counter after each training sentence."""
         self.step += 1
 
     def average_weights(self):
-        """Replace weights with their average over all training steps."""
+        # finish weight averaging after training is done
         if self.is_averaged or self.totals is None:
             return
         np.divide(self.totals, np.float32(self.step), out=self.totals)

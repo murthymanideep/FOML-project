@@ -1,10 +1,6 @@
-"""
-Train the dependency parsing pipeline and generate outputs/submission.csv.
-
-Usage:
-    python train_and_predict.py --check   # 90/10 validation split + hyperparameter tuning
-    python train_and_predict.py           # train on 100% of train.csv and predict test.csv
-"""
+# main script to train the dependency parsers and create outputs/submission.csv
+# run python train_and_predict.py --check for 90/10 val check
+# run python train_and_predict.py to train on full train.csv and predict test.csv
 
 import gc
 import json
@@ -20,9 +16,9 @@ import combiner
 from data_utils import (
     accuracy,
     build_lexicon,
-    find_possessive_markers,
     find_punct_forms,
-    make_hashing_repeatable,
+    fix_hash_seed,
+    get_possessive_words,
     normalize_word,
     read_sample_ids,
     read_sentences,
@@ -35,16 +31,16 @@ from parser import (
     GraphMSTParser,
     Parser,
     chu_liu_edmonds,
+    cv_mst,
     flip_list,
     flip_mst_info,
     flip_result,
     flip_sentence,
     flip_supertags,
     flip_tags,
-    jackknife_mst,
 )
 from tagger import (
-    jackknife_tags,
+    cv_tags,
     make_supertag_targets,
     make_tag_targets,
     make_upos_targets,
@@ -53,7 +49,7 @@ from tagger import (
 )
 
 
-# Config
+# settings
 DATA_FOLDER = "data"
 OUTPUT_FOLDER = "outputs"
 BEST_SETTINGS = "best_settings.json"
@@ -66,16 +62,16 @@ MST_EPOCHS = 8
 MST_SEEDS = 4
 TREE_LABELER_EPOCHS = 6
 TREE_LABELER_SEEDS = 4
-JACKKNIFE_FOLDS = 5
+CV_FOLDS = 5
 PARSER_EPOCHS = 12
 
-# Validation split: hold out every 10th block of 100 neighbouring sentences (10%)
+# val split: keep every 10th block of 100 sentences (10% val)
 CHECK_GROUP_SIZE = 100
 COMBINER_MIN_GAIN = 0.10
 L2_GRID = [1.0, 5.0, 15.0]
 
-# Balanced 18-parser ensemble across 3 transition systems and both reading directions:
-# (system_type, direction, seed, vote_weight)
+# 18 parsers: 6 arc-hybrid, 6 arc-eager, 6 arc-standard (both directions)
+# format: (parser_type, direction, seed, weight)
 PARSERS = [
     ("arc-hybrid",   "left-to-right", 1, 1.35),
     ("arc-eager",    "left-to-right", 1, 1.25),
@@ -123,15 +119,14 @@ def get_label_names(sentences):
 
 
 def make_tags(train_sentences, eval_sentences):
-    """Train UPOS, bidirectional role taggers, and supertagger (5-fold jackknife on train)."""
-    # 1. Induced UPOS tagger
+    # step 1: upos tagger
     upos_sentences = make_upos_targets(train_sentences)
     upos_names = get_label_names(upos_sentences)
-    print("[1/6] Training UPOS tagger (5-fold CV + %d-seed full)..." % TAGGER_SEEDS)
-    train_upos = jackknife_tags(
-        upos_sentences, upos_names, UPOS_EPOCHS, JACKKNIFE_FOLDS, direction="left-to-right"
+    print("Step 1/6: training upos tagger (5-fold cv + %d seeds)..." % TAGGER_SEEDS)
+    train_upos = cv_tags(
+        upos_sentences, upos_names, UPOS_EPOCHS, CV_FOLDS, direction="left-to-right"
     )
-    print("  UPOS CV accuracy: %.2f%%" % tag_accuracy(upos_sentences, train_upos))
+    print("  upos cv acc: %.2f%%" % tag_accuracy(upos_sentences, train_upos))
     upos_tagger = train_tagger(
         upos_sentences, upos_names, UPOS_EPOCHS, direction="left-to-right", n_seeds=TAGGER_SEEDS
     )
@@ -139,16 +134,16 @@ def make_tags(train_sentences, eval_sentences):
     upos_tagger = None
     gc.collect()
 
-    # 2. First-pass forward and backward syntactic taggers
+    # step 2: forward and backward role taggers
     tag_sentences = make_tag_targets(train_sentences)
     tag_names = get_label_names(tag_sentences)
 
-    print("[2/6] Training forward & backward syntactic taggers...")
-    train_tags_fwd = jackknife_tags(
-        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS,
+    print("Step 2/6: training left-to-right and right-to-left taggers...")
+    train_tags_fwd = cv_tags(
+        tag_sentences, tag_names, TAGGER_EPOCHS, CV_FOLDS,
         direction="left-to-right", upos_tags_list=train_upos,
     )
-    print("  L-to-R tag CV accuracy: %.2f%%" % tag_accuracy(tag_sentences, train_tags_fwd))
+    print("  left-to-right tag cv acc: %.2f%%" % tag_accuracy(tag_sentences, train_tags_fwd))
     tagger_fwd = train_tagger(
         tag_sentences, tag_names, TAGGER_EPOCHS,
         direction="left-to-right", upos_tags_list=train_upos, n_seeds=TAGGER_SEEDS,
@@ -160,11 +155,11 @@ def make_tags(train_sentences, eval_sentences):
     tagger_fwd = None
     gc.collect()
 
-    train_tags_bwd = jackknife_tags(
-        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS,
+    train_tags_bwd = cv_tags(
+        tag_sentences, tag_names, TAGGER_EPOCHS, CV_FOLDS,
         direction="right-to-left", upos_tags_list=train_upos,
     )
-    print("  R-to-L tag CV accuracy: %.2f%%" % tag_accuracy(tag_sentences, train_tags_bwd))
+    print("  right-to-left tag cv acc: %.2f%%" % tag_accuracy(tag_sentences, train_tags_bwd))
     tagger_bwd = train_tagger(
         tag_sentences, tag_names, TAGGER_EPOCHS,
         direction="right-to-left", upos_tags_list=train_upos, n_seeds=TAGGER_SEEDS,
@@ -176,14 +171,14 @@ def make_tags(train_sentences, eval_sentences):
     tagger_bwd = None
     gc.collect()
 
-    # 3. Second-pass bidirectional stacked tagger
-    print("[3/6] Training stacked bidirectional tagger...")
-    train_tags_2 = jackknife_tags(
-        tag_sentences, tag_names, TAGGER_EPOCHS, JACKKNIFE_FOLDS,
+    # step 3: second pass tagger combining both directions
+    print("Step 3/6: training stacked tagger...")
+    train_tags_2 = cv_tags(
+        tag_sentences, tag_names, TAGGER_EPOCHS, CV_FOLDS,
         first_tags_list=train_tags_fwd, direction="left-to-right",
         backward_tags_list=train_tags_bwd, upos_tags_list=train_upos,
     )
-    print("  Stacked tag CV accuracy: %.2f%%" % tag_accuracy(tag_sentences, train_tags_2))
+    print("  stacked tag cv acc: %.2f%%" % tag_accuracy(tag_sentences, train_tags_2))
     tagger_2 = train_tagger(
         tag_sentences, tag_names, TAGGER_EPOCHS,
         first_tags_list=train_tags_fwd, direction="left-to-right",
@@ -202,16 +197,16 @@ def make_tags(train_sentences, eval_sentences):
     tagger_2 = None
     gc.collect()
 
-    # 4. Head-offset supertagger
+    # step 4: head-offset supertagger
     super_sentences = make_supertag_targets(train_sentences)
     super_names = get_label_names(super_sentences)
-    print("[4/6] Training head-offset supertagger...")
-    train_supertags = jackknife_tags(
-        super_sentences, super_names, SUPERTAGGER_EPOCHS, JACKKNIFE_FOLDS,
+    print("Step 4/6: training supertagger...")
+    train_supertags = cv_tags(
+        super_sentences, super_names, SUPERTAGGER_EPOCHS, CV_FOLDS,
         first_tags_list=train_tags_2, direction="left-to-right",
         backward_tags_list=train_tags_bwd, upos_tags_list=train_upos,
     )
-    print("  Supertag CV accuracy: %.2f%%" % tag_accuracy(super_sentences, train_supertags))
+    print("  supertag cv acc: %.2f%%" % tag_accuracy(super_sentences, train_supertags))
     super_tagger = train_tagger(
         super_sentences, super_names, SUPERTAGGER_EPOCHS,
         first_tags_list=train_tags_2, direction="left-to-right",
@@ -244,15 +239,15 @@ def make_mst_guides(
     eval_upos,
     lexicon_ltr,
 ):
-    """Train 5-fold jackknifed Graph-MST for train and a 3-seed Graph-MST for eval."""
-    print("[5/6] Training Graph-MST parser (5-fold CV + %d-seed full)..." % MST_SEEDS)
-    train_mst = jackknife_mst(
+    # train 5-fold cv mst on train data and 4-seed mst for eval/test
+    print("Step 5/6: training graph mst parser (5-fold cv + %d seeds)..." % MST_SEEDS)
+    train_mst = cv_mst(
         train_sentences, train_tags, train_supertags,
-        upos_list=train_upos, epochs=MST_EPOCHS, n_folds=JACKKNIFE_FOLDS,
+        upos_list=train_upos, epochs=MST_EPOCHS, n_folds=CV_FOLDS,
     )
     dummy_labels = [["root"] * len(s["words"]) for s in train_sentences]
     mst_uas, _ = accuracy(train_sentences, [m["heads"] for m in train_mst], dummy_labels)
-    print("  Graph-MST CV UAS: %.2f%%" % mst_uas)
+    print("  mst cv uas: %.2f%%" % mst_uas)
 
     mst_models = []
     for s in range(1, MST_SEEDS + 1):
@@ -261,7 +256,7 @@ def make_mst_guides(
         mst_models.append(mdl)
 
     eval_mst = [
-        mst_models[0].predict_mst_info(
+        mst_models[0].predict_mst(
             eval_sentences[k]["words"],
             eval_tags[k],
             eval_supertags[k],
@@ -293,7 +288,7 @@ def train_one_parser(
     lexicon_ltr,
     lexicon_rtl,
 ):
-    """Train one transition parser and return its (heads, labels, margins) on eval_sentences."""
+    # train one transition parser and get its predictions on eval_sentences
     if direction == "right-to-left":
         tr_sents = [flip_sentence(s) for s in train_sentences]
         tr_tags = [flip_tags(t) for t in train_tags]
@@ -351,21 +346,21 @@ def train_one_parser(
     return (all_heads, all_labels, all_margins)
 
 
-def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=None, possessive_markers=None):
-    """Apply simple UD consistency fixes to one decoded tree."""
+def fix_tree_rules(words, heads, labels, upos=None, punct_forms=None, rules=None, possessive_markers=None):
+    # apply simple post-processing rules to fix common label mistakes
     if rules is None:
         rules = DEFAULT_RULES
     n = len(words) - 1
     if n <= 0:
         return heads, labels
 
-    # 1. Punctuation tokens always get the "punct" label
+    # 1. punctuation tokens get punct label
     if rules["punct"] and punct_forms is not None:
         for i in range(1, n + 1):
             if heads[i] != 0 and words[i] in punct_forms:
                 labels[i] = "punct"
 
-    # 2. Keep multi-word proper names ("flat") connected
+    # 2. keep multi-word names connected with flat
     if rules["flat"]:
         for i in range(2, n):
             if heads[i + 1] == i - 1 and labels[i + 1] == "flat":
@@ -381,7 +376,7 @@ def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=Non
         if 0 <= h <= n:
             children[h].append(i)
 
-    # 3. Passive predicates (aux:pass) take nsubj:pass instead of nsubj
+    # 3. passive verbs with aux:pass take nsubj:pass instead of nsubj
     if rules["passive"]:
         for h in range(1, n + 1):
             has_aux_pass = any(labels[ch] == "aux:pass" for ch in children[h])
@@ -394,7 +389,7 @@ def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=Non
     if not rules["obl_nmod"]:
         return heads, labels
 
-    # 4. Prepositional & possessive phrases: obl <-> nmod / nmod:poss
+    # 4. fix obl vs nmod and possessive nmod:poss
     nominal_head_labels = {
         "obj", "iobj", "nsubj", "nsubj:pass",
         "nmod", "nmod:poss", "nmod:unmarked", "nmod:desc",
@@ -446,11 +441,10 @@ def _refine_ud_tree(words, heads, labels, upos=None, punct_forms=None, rules=Non
 
 
 def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules, possessive_markers):
-    """Apply UD consistency rules to copies of all trees."""
     new_heads = []
     new_labels = []
     for k in range(len(sentences)):
-        heads, labels = _refine_ud_tree(
+        heads, labels = fix_tree_rules(
             sentences[k]["words"],
             list(all_heads[k]),
             list(all_labels[k]),
@@ -465,7 +459,7 @@ def apply_rules(sentences, all_heads, all_labels, upos_list, punct_forms, rules,
 
 
 def vote(outputs):
-    """Combine all parsers + 3-seed MST via Chu-Liu/Edmonds and 3-seed full-tree labeler."""
+    # combine all transition parsers + mst via chu-liu-edmonds and full-tree labeler
     predictions = outputs["predictions"]
     sentences = outputs["sentences"]
     weights = outputs["weights"]
@@ -491,7 +485,7 @@ def vote(outputs):
         punct_flags = [False] + [punct_forms is not None and words[i] in punct_forms for i in range(1, n + 1)]
         all_punct = all(punct_flags[1:])
 
-        # Build the global arc score matrix
+        # build arc score matrix for chu-liu-edmonds
         arc_scores = np.full((n + 1, n + 1), -1.0e4, dtype=np.float64)
         for h in range(n + 1):
             for m in range(1, n + 1):
@@ -593,39 +587,37 @@ def finish_trees(outputs, heads, labels, rules):
 
 
 def print_error_report(sentences, heads, labels):
-    """Print a short summary of remaining head and label errors on validation."""
     total = wrong_head = wrong_label = 0
-    total_of = {}
-    wrong_of = {}
+    label_total = {}
+    label_wrong = {}
     mix_ups = {}
     for k in range(len(sentences)):
         for i in range(1, len(sentences[k]["words"])):
             gh = sentences[k]["heads"][i]
             gl = sentences[k]["labels"][i]
             total += 1
-            total_of[gl] = total_of.get(gl, 0) + 1
+            label_total[gl] = label_total.get(gl, 0) + 1
             if heads[k][i] != gh:
                 wrong_head += 1
-                wrong_of[gl] = wrong_of.get(gl, 0) + 1
+                label_wrong[gl] = label_wrong.get(gl, 0) + 1
             elif labels[k][i] != gl:
                 wrong_label += 1
-                wrong_of[gl] = wrong_of.get(gl, 0) + 1
+                label_wrong[gl] = label_wrong.get(gl, 0) + 1
                 pair = gl + " -> " + labels[k][i]
                 mix_ups[pair] = mix_ups.get(pair, 0) + 1
 
-    print("\nError breakdown (%d tokens):" % total)
-    print("  Wrong head:             %5d (%.2f%%)" % (wrong_head, 100.0 * wrong_head / total))
-    print("  Right head, wrong label:%5d (%.2f%%)" % (wrong_label, 100.0 * wrong_label / total))
-    print("  Top error labels:")
-    for (cnt, lab) in sorted(((c, l) for l, c in wrong_of.items()), reverse=True)[:12]:
-        print("    %-15s %5d / %5d  (-%.2f%%)" % (lab, cnt, total_of[lab], 100.0 * cnt / total))
-    print("  Top label confusions (gold -> pred):")
+    print("\nError summary (%d tokens):" % total)
+    print("  wrong head:               %5d (%.2f%%)" % (wrong_head, 100.0 * wrong_head / total))
+    print("  right head, wrong label:  %5d (%.2f%%)" % (wrong_label, 100.0 * wrong_label / total))
+    print("  top error labels:")
+    for (cnt, lab) in sorted(((c, l) for l, c in label_wrong.items()), reverse=True)[:12]:
+        print("    %-15s %5d / %5d  (-%.2f%%)" % (lab, cnt, label_total[lab], 100.0 * cnt / total))
+    print("  common label mistakes (true -> pred):")
     for (cnt, pair) in sorted(((c, p) for p, c in mix_ups.items()), reverse=True)[:10]:
         print("    %-30s %5d" % (pair, cnt))
 
 
 def run_pipeline(train_sentences, eval_sentences, is_val=False):
-    """Shared training pipeline used for both 90/10 validation and 100% final training."""
     label_names = get_label_names(train_sentences)
     punct_forms = find_punct_forms(train_sentences)
 
@@ -633,7 +625,7 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
         train_sentences, eval_sentences
     )
     if is_val:
-        print("  Val UPOS: %.2f%% | Tag: %.2f%% | Supertag: %.2f%%" % (
+        print("  val upos: %.2f%% | tag: %.2f%% | supertag: %.2f%%" % (
             tag_accuracy(make_upos_targets(eval_sentences), eval_upos),
             tag_accuracy(make_tag_targets(eval_sentences), eval_tags),
             tag_accuracy(make_supertag_targets(eval_sentences), eval_supertags),
@@ -654,9 +646,9 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
     if is_val:
         dummy = [["root"] * len(s["words"]) for s in eval_sentences]
         mst_uas, _ = accuracy(eval_sentences, [m["heads"] for m in eval_mst], dummy)
-        print("  Val %d-seed Graph-MST UAS: %.2f%%" % (MST_SEEDS, mst_uas))
+        print("  val %d-seed mst uas: %.2f%%" % (MST_SEEDS, mst_uas))
 
-    print("[6/6] Training %d-seed full-tree labeler and %d transition parsers..."
+    print("Step 6/6: training %d-seed tree labeler and %d parsers..."
           % (TREE_LABELER_SEEDS, len(PARSERS)))
     labeler_models = []
     for s in range(1, TREE_LABELER_SEEDS + 1):
@@ -681,7 +673,7 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
         gc.collect()
         if is_val:
             uas, las = accuracy(eval_sentences, res[0], res[1])
-            print("  [%2d/%d] %-12s %-13s seed=%d -> UAS %.2f  LAS %.2f"
+            print("  [%2d/%d] %-12s %-13s seed=%d -> uas %.2f  las %.2f"
                   % (idx, len(PARSERS), system_type, direction, seed, uas, las))
         else:
             print("  [%2d/%d] %-12s %-13s seed=%d done"
@@ -698,39 +690,38 @@ def run_pipeline(train_sentences, eval_sentences, is_val=False):
         "mst": eval_mst,
         "tree_labeler": labeler_models[0],
         "extra_labelers": labeler_models[1:],
-        "second_order": None,
         "punct_forms": punct_forms,
-        "possessive_markers": find_possessive_markers(train_sentences),
+        "possessive_markers": get_possessive_words(train_sentences),
     }
 
 
 def tune_on_validation(outputs):
-    """Tune UD rules and combiner L2 on the 10% validation set and save best_settings.json."""
+    # check rules and combiner on 10% val set and save best_settings.json
     sentences = outputs["sentences"]
     voted_heads, voted_labels = vote(outputs)
     base_uas, base_las = accuracy(sentences, voted_heads, voted_labels)
-    print("\nEnsemble vote (before rules): UAS %.2f  LAS %.2f" % (base_uas, base_las))
+    print("\nVote before rules: uas %.2f  las %.2f" % (base_uas, base_las))
 
-    # 1. Pick best UD rule combination
-    print("\nTesting post-processing rules on validation:")
+    # test post-processing rules
+    print("\nChecking rules on val:")
     best_rules = DEFAULT_RULES
     best_rules_las = -1.0
     best_rule_name = ""
     for (name, rules) in RULE_VARIANTS:
         fh, fl = finish_trees(outputs, voted_heads, voted_labels, rules)
         uas, las = accuracy(sentences, fh, fl)
-        print("  %-18s -> UAS %.2f  LAS %.2f" % (name, uas, las))
+        print("  %-18s -> uas %.2f  las %.2f" % (name, uas, las))
         if las > best_rules_las:
             best_rules_las = las
             best_rules = rules
             best_rule_name = name
-    print("  Best rules: %s" % best_rule_name)
+    print("  best rules: %s" % best_rule_name)
 
     hand_heads, hand_labels = finish_trees(outputs, voted_heads, voted_labels, best_rules)
     hand_uas, hand_las = accuracy(sentences, hand_heads, hand_labels)
 
-    # 2. Tune softmax combiner L2 via 2-fold CV on the validation split
-    print("\nTuning softmax combiner L2 (2-fold CV on validation):")
+    # try softmax combiner with 2-fold cv on val
+    print("\nChecking combiner l2 values on val:")
     best_l2 = 5.0
     best_comb_las = -1.0
     best_comb_trees = None
@@ -738,21 +729,21 @@ def tune_on_validation(outputs):
         ch, cl = combiner.cross_validate(outputs, l2=l2)
         ch, cl = finish_trees(outputs, ch, cl, best_rules)
         uas, las = accuracy(sentences, ch, cl)
-        print("  l2=%-4.1f -> UAS %.2f  LAS %.2f" % (l2, uas, las))
+        print("  l2=%-4.1f -> uas %.2f  las %.2f" % (l2, uas, las))
         if las > best_comb_las:
             best_comb_las = las
             best_l2 = l2
             best_comb_trees = (ch, cl)
 
     use_combiner = best_comb_las >= hand_las + COMBINER_MIN_GAIN
-    print("\nValidation summary:")
-    print("  Normal vote:               UAS %.2f  LAS %.2f" % (hand_uas, hand_las))
-    print("  Softmax combiner (l2=%.1f): LAS %.2f" % (best_l2, best_comb_las))
+    print("\nVal results:")
+    print("  normal vote:               uas %.2f  las %.2f" % (hand_uas, hand_las))
+    print("  softmax combiner (l2=%.1f): las %.2f" % (best_l2, best_comb_las))
     if use_combiner:
-        print("  -> Selected: softmax combiner (+%.2f LAS)" % (best_comb_las - hand_las))
+        print("  picked: softmax combiner (+%.2f las)" % (best_comb_las - hand_las))
         print_error_report(sentences, best_comb_trees[0], best_comb_trees[1])
     else:
-        print("  -> Selected: normal vote")
+        print("  picked: normal vote")
         print_error_report(sentences, hand_heads, hand_labels)
 
     model = combiner.train_combiner(outputs, list(range(len(sentences))), l2=best_l2)
@@ -772,11 +763,10 @@ def tune_on_validation(outputs):
     }
     with open(BEST_SETTINGS, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=1)
-    print("\nSaved tuned settings to %s" % BEST_SETTINGS)
+    print("\nSaved settings to %s" % BEST_SETTINGS)
 
 
 def decode_final_trees(outputs):
-    """Decode test trees using best_settings.json if available, otherwise normal vote."""
     rules = DEFAULT_RULES
     model = None
 
@@ -794,45 +784,43 @@ def decode_final_trees(outputs):
                     "arc_weights": np.array(saved["arc_weights"]),
                     "label_weights": np.array(saved["label_weights"]),
                 }
-        print("Loaded tuned settings from %s" % BEST_SETTINGS)
+        print("Using settings from %s" % BEST_SETTINGS)
     else:
-        print("No %s found; using default vote and rules" % BEST_SETTINGS)
+        print("No %s found, using default vote and rules" % BEST_SETTINGS)
 
     if model is not None:
-        print("Decoding test trees with softmax combiner...")
-        heads_of, labels_of = combiner.combine(outputs, model)
-        heads = [heads_of[k] for k in range(len(outputs["sentences"]))]
-        labels = [labels_of[k] for k in range(len(outputs["sentences"]))]
+        print("Combining test trees with softmax combiner...")
+        pred_heads, pred_labels = combiner.combine(outputs, model)
+        heads = [pred_heads[k] for k in range(len(outputs["sentences"]))]
+        labels = [pred_labels[k] for k in range(len(outputs["sentences"]))]
     else:
-        print("Decoding test trees with normal vote...")
+        print("Combining test trees with normal vote...")
         heads, labels = vote(outputs)
 
     return finish_trees(outputs, heads, labels, rules)
 
 
 def write_final_submission(test_sentences, test_heads, test_labels, train_sentences):
-    """Write outputs/submission.csv matching data/sample.csv IDs."""
-    answer_of_id = {}
+    pred_map = {}
     for k in range(len(test_sentences)):
         for i in range(1, len(test_sentences[k]["words"])):
             row_id = test_sentences[k]["row_ids"][i - 1]
-            answer_of_id[row_id] = "%d|%s" % (test_heads[k][i], test_labels[k][i])
+            pred_map[row_id] = "%d|%s" % (test_heads[k][i], test_labels[k][i])
 
-    # Include training IDs only if sample.csv lists them (Kaggle evaluates test rows)
+    # add train ids too just in case sample.csv has them
     for k in range(len(train_sentences)):
         for i in range(1, len(train_sentences[k]["words"])):
             row_id = train_sentences[k]["row_ids"][i - 1]
-            answer_of_id[row_id] = "%d|%s" % (train_sentences[k]["heads"][i], train_sentences[k]["labels"][i])
+            pred_map[row_id] = "%d|%s" % (train_sentences[k]["heads"][i], train_sentences[k]["labels"][i])
 
     sample_ids, header = read_sample_ids(os.path.join(DATA_FOLDER, "sample.csv"))
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     output_path = os.path.join(OUTPUT_FOLDER, "submission.csv")
-    write_submission(output_path, header, sample_ids, answer_of_id)
+    write_submission(output_path, header, sample_ids, pred_map)
     print("Saved %d predictions to %s" % (len(sample_ids), output_path))
 
 
 def check_mode(all_train):
-    """90% train / 10% document-grouped validation split for tuning."""
     train_sentences = []
     val_sentences = []
     for k, sentence in enumerate(all_train):
@@ -840,13 +828,12 @@ def check_mode(all_train):
             val_sentences.append(sentence)
         else:
             train_sentences.append(sentence)
-    print("Validation mode: %d train / %d val sentences" % (len(train_sentences), len(val_sentences)))
+    print("Val mode: %d train / %d val sentences" % (len(train_sentences), len(val_sentences)))
     outputs = run_pipeline(train_sentences, val_sentences, is_val=True)
     tune_on_validation(outputs)
 
 
 def final_mode(train_sentences):
-    """Train on 100% of train.csv and write test predictions."""
     test_sentences = read_sentences(os.path.join(DATA_FOLDER, "test.csv"))
     print("Final mode: %d train / %d test sentences" % (len(train_sentences), len(test_sentences)))
     outputs = run_pipeline(train_sentences, test_sentences, is_val=False)
@@ -855,14 +842,14 @@ def final_mode(train_sentences):
 
 
 def main():
-    make_hashing_repeatable()
+    fix_hash_seed()
     start_time = time.time()
     train_sentences = read_sentences(os.path.join(DATA_FOLDER, "train.csv"))
     if "--check" in sys.argv:
         check_mode(train_sentences)
     else:
         final_mode(train_sentences)
-    print("Finished in %.1f minutes" % ((time.time() - start_time) / 60.0))
+    print("Done in %.1f minutes" % ((time.time() - start_time) / 60.0))
 
 
 if __name__ == "__main__":

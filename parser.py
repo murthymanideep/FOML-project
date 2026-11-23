@@ -1,11 +1,8 @@
-"""
-Dependency parsers built on linear structured perceptrons:
-  - chu_liu_edmonds: single-root maximum spanning tree decoder
-  - GraphMSTParser: first-order graph parser (48 vectorized edge templates)
-  - Parser / ArcEagerParser / ArcStandardParser: three transition systems
-  - SecondOrderTreeModel: grandparent, sibling, valency, and crossing scorer
-  - FullTreeLabeler: full-tree dependency label classifier
-"""
+# dependency parsers using averaged perceptron:
+# - chu_liu_edmonds: single-root mst tree decoder
+# - GraphMSTParser: first-order graph parser with 42 edge templates
+# - Parser / ArcEagerParser / ArcStandardParser: 3 transition parsers
+# - FullTreeLabeler: full-tree label classifier
 
 import random
 import numpy as np
@@ -21,7 +18,7 @@ from data_utils import (
     head_offset_bucket,
     is_punct_word,
     build_lexicon,
-    lookup_word_priors,
+    get_word_info,
 )
 from perceptron import AveragedPerceptron
 
@@ -30,19 +27,14 @@ SHIFT = 0
 LEFT = 1
 RIGHT = 2
 REDUCE = 3
-NONE = -1          # "no word here"
-VERY_LOW = -1.0e9  # score given to moves that are not allowed
+NONE = -1          # no word
+VERY_LOW = -1.0e9  # invalid move score
 
 
-# =====================================================================
-# 1. Exact Single-Root Chu-Liu/Edmonds Maximum Spanning Arborescence
-# =====================================================================
+# chu-liu-edmonds max spanning tree decoder
 
-def _cle_unconstrained(scores, n_nodes):
-    """
-    Recursive Chu-Liu/Edmonds algorithm returning `par[0..n_nodes-1]`
-    that maximizes `sum_{m=1..n_nodes-1} scores[par[m], m]`.
-    """
+def cle_helper(scores, n_nodes):
+    # recursive chu-liu-edmonds for max spanning tree
     par = [-1] * n_nodes
     for m in range(1, n_nodes):
         best_h = 0
@@ -80,24 +72,24 @@ def _cle_unconstrained(scores, n_nodes):
         in_cycle[u] = True
 
     new_id = [-1] * n_nodes
-    orig_of = []
+    orig_nodes = []
     for u in range(n_nodes):
         if not in_cycle[u]:
-            new_id[u] = len(orig_of)
-            orig_of.append(u)
+            new_id[u] = len(orig_nodes)
+            orig_nodes.append(u)
 
-    c_id = len(orig_of)
+    c_id = len(orig_nodes)
     n_sub = c_id + 1
     sub_scores = np.full((n_sub, n_sub), -1.0e12, dtype=np.float64)
 
-    for u in orig_of:
+    for u in orig_nodes:
         iu = new_id[u]
-        for v in orig_of:
+        for v in orig_nodes:
             if u != v and v != 0:
                 sub_scores[iu, new_id[v]] = scores[u, v]
 
     best_out = {}
-    for v in orig_of:
+    for v in orig_nodes:
         if v == 0:
             continue
         iv = new_id[v]
@@ -112,7 +104,7 @@ def _cle_unconstrained(scores, n_nodes):
         best_out[iv] = best_u
 
     best_in = {}
-    for u in orig_of:
+    for u in orig_nodes:
         iu = new_id[u]
         best_v = cycle[0]
         best_val = -1.0e18
@@ -124,30 +116,25 @@ def _cle_unconstrained(scores, n_nodes):
         sub_scores[iu, c_id] = best_val
         best_in[iu] = best_v
 
-    sub_par = _cle_unconstrained(sub_scores, n_sub)
+    sub_par = cle_helper(sub_scores, n_sub)
 
     for iv in range(1, c_id):
-        v = orig_of[iv]
+        v = orig_nodes[iv]
         sp = sub_par[iv]
         if sp == c_id:
             par[v] = best_out[iv]
         else:
-            par[v] = orig_of[sp]
+            par[v] = orig_nodes[sp]
 
     iu_enter = sub_par[c_id]
-    u_enter = orig_of[iu_enter]
+    u_enter = orig_nodes[iu_enter]
     v_enter = best_in[iu_enter]
     par[v_enter] = u_enter
     return par
 
 
 def chu_liu_edmonds(score_matrix):
-    """
-    Find the exact single-root Maximum Spanning Arborescence rooted at 0.
-    `score_matrix` has shape (n + 1, n + 1) where entry [h, m] is the score
-    of attaching modifier m (1..n) to head h (0..n).
-    Returns `heads` as a list of length n + 1 with `heads[0] = -1`.
-    """
+    # find best single-root dependency tree rooted at 0
     n = score_matrix.shape[0] - 1
     if n <= 0:
         return [-1]
@@ -159,7 +146,7 @@ def chu_liu_edmonds(score_matrix):
     for i in range(n + 1):
         scores[i, i] = -1.0e12
 
-    par = _cle_unconstrained(scores, n + 1)
+    par = cle_helper(scores, n + 1)
     roots = [m for m in range(1, n + 1) if par[m] == 0]
     if len(roots) == 1:
         return par
@@ -171,7 +158,7 @@ def chu_liu_edmonds(score_matrix):
         s_copy = scores.copy()
         s_copy[0, :] = -1.0e12
         s_copy[0, r] = scores[0, r]
-        cand_par = _cle_unconstrained(s_copy, n + 1)
+        cand_par = cle_helper(s_copy, n + 1)
         total = sum(float(scores[cand_par[m], m]) for m in range(1, n + 1))
         if total > best_total:
             best_total = total
@@ -179,12 +166,9 @@ def chu_liu_edmonds(score_matrix):
     return best_par
 
 
-# =====================================================================
-# 2. Precomputed Sentence Context (with UPOS, Stems, Lookahead & MST)
-# =====================================================================
+# precomputed sentence info (words, tags, upos, prefix sums, mst hints)
 
 class SentenceContext:
-    """Precomputes all token-level strings, UPOS, lookahead tables, and prefix sums."""
 
     def __init__(
         self,
@@ -218,7 +202,7 @@ class SentenceContext:
 
         if lexicon is not None:
             priors = [
-                lookup_word_priors(lexicon, raw_words[i], self.words[i], i)
+                get_word_info(lexicon, raw_words[i], self.words[i], i)
                 for i in range(n + 1)
             ]
             self.dom_tags = [p[0] for p in priors]
@@ -238,7 +222,7 @@ class SentenceContext:
             self.super_offset = ["<NONE>"] * (n + 1)
             self.super_hcg = ["<NONE>"] * (n + 1)
 
-        # Global MST guide signals (Nivre & McDonald 2008)
+        # mst parser hints
         if mst_info is not None:
             self.mst_h1 = mst_info["heads"]
             self.mst_h2 = mst_info["heads2"]
@@ -259,7 +243,7 @@ class SentenceContext:
             self.mst_max_right_child = None
             self.mst_min_left_child = None
 
-        # Prefix sums for O(1) in-between structural queries
+        # prefix counts for quick between-word queries
         self.verb_prefix = [0] * (n + 2)
         self.comma_prefix = [0] * (n + 2)
         self.cc_prefix = [0] * (n + 2)
@@ -290,7 +274,7 @@ class SentenceContext:
         self.cc_prefix[n + 1] = cc_cnt
         self.punct_prefix[n + 1] = p_cnt
 
-        # Buffer lookahead arrays
+        # lookahead arrays for upcoming clause/root/noun phrase
         self.next_clause_pos = [0] * (n + 2)
         self.has_root_ahead = ["False"] * (n + 2)
         next_cl = 0
@@ -317,7 +301,7 @@ class SentenceContext:
                 self.np_end_pos[i] = i
 
     def between_counts(self, a, b):
-        """Return binned (verbs, commas, conjunctions) strictly between a and b."""
+        # count verbs, commas, and conjunctions between positions a and b
         if a <= 0 or b <= 0:
             return "0_0_0"
         lo = a if a < b else b
@@ -330,9 +314,7 @@ class SentenceContext:
         return f"{nv}_{nc}_{ncc}"
 
 
-# =====================================================================
-# 3. Fast Vectorized 42-Template First-Order Graph-Based MST Parser
-# =====================================================================
+# first-order graph MST parser (42 edge templates)
 
 _MASK_64 = (1 << 64) - 1
 _P1 = 0x9E3779B97F4A7C15
@@ -341,16 +323,10 @@ _P3 = 0x94D049BB133111EB
 
 
 def _h64(text):
-    """Deterministic 64-bit integer hash for a string token attribute."""
     return hash(text) & _MASK_64
 
 
 class GraphMSTParser:
-    """
-    Global First-Order Arc-Factored Graph-Based Dependency Parser trained with
-    Margin-Infused Structured Perceptron and Chu-Liu/Edmonds MST decoding.
-    Uses 42 vectorized 2D NumPy uint64 feature templates (including UPOS).
-    """
 
     def __init__(self, lexicon=None, n_rows=2 ** 22):
         self.lexicon = lexicon
@@ -366,11 +342,8 @@ class GraphMSTParser:
             np.uint64(rng.getrandbits(64) | 1) for _ in range(42)
         ]
 
-    def _extract_edge_feature_cube(self, ctx):
-        """
-        Return a 3D uint64 array `F` of shape `(42, n + 1, n + 1)` containing
-        the hashed feature row indices for every directed edge (h -> m).
-        """
+    def build_edge_features(self, ctx):
+        # build (42, n+1, n+1) array of hashed feature indices for every edge h -> m
         n = ctx.n
         size = n + 1
 
@@ -456,7 +429,7 @@ class GraphMSTParser:
 
         zero_vec = np.zeros(size, dtype=np.uint64)
         templates = [
-            # Core lexical + tag + distance/direction templates
+            # basic word, stem, tag, and distance templates
             mix(hw, hw, dir_mat, 0),
             mix(hw, hw, dd_mat, 1),
             mix(hst, hst, dir_mat, 2),
@@ -476,14 +449,14 @@ class GraphMSTParser:
             mix(hbt, hbt, dd_mat, 16),
             mix(hcg, hcg, dd_mat, 17),
 
-            # In-between verb/comma/conjunction structural templates
+            # in-between verb/comma/conjunction templates
             mix(ht, ht, btw_mat, 18),
             mix(hcg, hcg, btw_mat, 19),
             mix(hbt, hbt, btw_mat, 20),
             mix(hwc, hcg, btw_mat, 21),
             mix(hcg, hwc, btw_mat, 22),
 
-            # Contextual surrounding tag/word templates
+            # neighbor tag and word templates
             mix(ht ^ (ht_l1 * p3), ht, dd_mat, 23),
             mix(ht ^ (ht_r1 * p3), ht, dd_mat, 24),
             mix(ht, ht ^ (ht_l1 * p3), dd_mat, 25),
@@ -492,7 +465,7 @@ class GraphMSTParser:
             mix(hw ^ (hw_r1 * p3), ht, dir_mat, 28),
             mix(ht, hw ^ (hw_l1 * p3), dir_mat, 29),
 
-            # Lexicon prior, signature, direction, & supertag agreement templates
+            # lexicon stats, signature, direction, and supertag templates
             mix(hdom, hdom, dd_mat, 30),
             mix(hsig, hsig, dd_mat, 31),
             mix(hdir, hdir, dd_mat, 32),
@@ -500,7 +473,7 @@ class GraphMSTParser:
             mix(ht, hsup, dir_mat, 34),
             mix(zero_vec, ht, sup_match_mat, 35),
 
-            # Induced POS (`upos`) global arc templates
+            # upos templates
             mix(hu, hu, dd_mat, 36),
             mix(hwu, hwu, dir_mat, 37),
             mix(hu, ht, btw_mat, 38),
@@ -510,8 +483,8 @@ class GraphMSTParser:
         ]
         return np.stack(templates, axis=0)
 
-    def score_Create_matrix(self, ctx):
-        F = self._extract_edge_feature_cube(ctx)
+    def get_score_matrix(self, ctx):
+        F = self.build_edge_features(ctx)
         w = self.weights
         scores = w[F].sum(axis=0, dtype=np.float64)
         n = ctx.n
@@ -528,7 +501,7 @@ class GraphMSTParser:
     def train_one_sentence(self, words, tags, gold_heads, supertags=None, upos=None):
         ctx = SentenceContext(words, tags, supertags, self.lexicon, upos=upos)
         n = ctx.n
-        scores, F = self.score_Create_matrix(ctx)
+        scores, F = self.get_score_matrix(ctx)
 
         aug_scores = scores.copy()
         for m in range(1, n + 1):
@@ -576,26 +549,15 @@ class GraphMSTParser:
                 )
         self.average_weights()
 
-    def predict_mst_info(self, words, tags, supertags=None, upos=None, second_model=None, extra_models=None):
-        """
-        Return a dictionary with:
-          - 'heads'  : 1-best Chu-Liu/Edmonds MST heads [0..n]
-          - 'heads2' : 2nd-best head per token [0..n]
-          - 'heads3' : 3rd-best head per token [0..n]
-          - 'conf'   : margin confidence bucket ('HIGH', 'MID', 'LOW') per token
-          - 'margins': numeric margin per token
-        """
+    def predict_mst(self, words, tags, supertags=None, upos=None, extra_models=None):
+        # predict top-3 heads, confidence level, and margin for each word
         ctx = SentenceContext(words, tags, supertags, self.lexicon, upos=upos)
         n = ctx.n
-        scores, _ = self.score_Create_matrix(ctx)
-        models = []
-        if second_model is not None:
-            models.append(second_model)
-        if extra_models is not None:
-            models.extend(extra_models)
+        scores, _ = self.get_score_matrix(ctx)
+        models = list(extra_models) if extra_models is not None else []
         if models:
             for mdl in models:
-                sc_m, _ = mdl.score_Create_matrix(ctx)
+                sc_m, _ = mdl.get_score_matrix(ctx)
                 scores += sc_m
             scores *= (1.0 / (1 + len(models)))
 
@@ -635,11 +597,8 @@ class GraphMSTParser:
         }
 
 
-def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epochs=7, n_folds=5):
-    """
-    Produce out-of-fold Global Graph MST predictions for training sentences
-    so transition parsers can use them without overfitting.
-    """
+def cv_mst(sentences, tags_list, supertags_list=None, upos_list=None, epochs=7, n_folds=5):
+    # 5-fold out-of-fold mst predictions for train data
     mst_infos = [None] * len(sentences)
     for fold in range(n_folds):
         train_sents = []
@@ -675,19 +634,17 @@ def jackknife_mst(sentences, tags_list, supertags_list=None, upos_list=None, epo
         for k in held_out:
             stags = supertags_list[k] if supertags_list is not None else None
             utags = upos_list[k] if upos_list is not None else None
-            mst_infos[k] = model.predict_mst_info(
+            mst_infos[k] = model.predict_mst(
                 sentences[k]["words"], tags_list[k], stags, utags
             )
-        print("  MST fold %d/%d done" % (fold + 1, n_folds))
+        print("  mst fold %d/%d done" % (fold + 1, n_folds))
     return mst_infos
 
 
-# =====================================================================
-# 4. Transition Parser States & Shared Feature Extractor
-# =====================================================================
+# transition parser states and shared features
 
 class ParserState:
-    """Arc-Hybrid state maintained in O(1)."""
+    # arc-hybrid state
 
     def __init__(self, n_words, words=None, is_punct=None):
         self.n = n_words
@@ -830,7 +787,7 @@ def distance_text(a, b):
 
 
 def move_costs(state, gold_heads, gold_children):
-    """Dynamic oracle for Arc-Hybrid."""
+    # dynamic oracle costs for arc-hybrid
     s0 = state.stack_word(0)
     s1 = state.stack_word(1)
     b0 = state.buffer_word(0)
@@ -868,8 +825,8 @@ def move_costs(state, gold_heads, gold_children):
     return [shift_cost, left_cost, right_cost]
 
 
-def _extract_shared_features(ctx, state):
-    """Shared feature extractor for Arc-Hybrid, Arc-Eager, and Arc-Standard states."""
+def get_parser_features(ctx, state):
+    # shared features used by all 3 transition parsers
     words = ctx.words
     stems = ctx.stems
     tags = ctx.tags
@@ -1039,7 +996,7 @@ def _extract_shared_features(ctx, state):
     s1_before = s1 - 1 if (s1 > 1) else NONE
     s1_after = s1 + 1 if (0 < s1 < state.n) else NONE
 
-    # Supertag offset agreement checks
+    # supertag offset checks
     s0_st = "<NONE>" if s0 == NONE else supertags[s0]
     n0_st = "<NONE>" if n0 == NONE else supertags[n0]
     s1_st = "<NONE>" if s1 == NONE else supertags[s1]
@@ -1055,7 +1012,7 @@ def _extract_shared_features(ctx, state):
         left_off_match = "NONE"
         right_off_match = "NONE"
 
-    # Buffer lookahead features
+    # buffer lookahead features
     b_pos = state.buffer_position
     if b_pos <= state.n:
         next_cl = ctx.next_clause_pos[b_pos]
@@ -1075,7 +1032,7 @@ def _extract_shared_features(ctx, state):
     f = [
         "bias",
 
-        # Single words, stems, tags, UPOS, signatures, and lexicon priors
+        # single word, stem, tag, upos, signature, and lexicon features
         "s0w=" + s0w, "s0st=" + s0st, "s0t=" + s0t, "s0wt=" + s0wt, "s0bt=" + s0bt, "s0cg=" + s0cg, "s0u=" + s0u,
         "s1w=" + s1w, "s1st=" + s1st, "s1t=" + s1t, "s1wt=" + s1wt, "s1bt=" + s1bt, "s1cg=" + s1cg, "s1u=" + s1u,
         "s2w=" + s2w, "s2t=" + s2t, "s2cg=" + s2cg, "s2u=" + s2u, "s3t=" + s3t,
@@ -1089,7 +1046,7 @@ def _extract_shared_features(ctx, state):
         "n0p=" + ("<NONE>" if n0 == NONE else dom_tags[n0]),
         "s1p=" + ("<NONE>" if s1 == NONE else dom_tags[s1]),
 
-        # Pairs of stack0 and buffer0 (words, stems, tags, UPOS, coarse groups)
+        # s0 and n0 pairs
         "s0wt+n0wt=" + s0wt + "+" + n0wt,
         "s0wt+n0w=" + s0wt + "+" + n0w,
         "s0w+n0wt=" + s0w + "+" + n0wt,
@@ -1109,7 +1066,7 @@ def _extract_shared_features(ctx, state):
         "s0amb+n0amb=" + s0amb + "+" + n0amb,
         "s0clu+n0clu=" + s0clu + "+" + n0clu,
 
-        # Pairs of stack1 and stack0
+        # s1 and s0 pairs
         "s1wt+s0wt=" + s1wt + "+" + s0wt,
         "s1wt+s0w=" + s1wt + "+" + s0w,
         "s1w+s0wt=" + s1w + "+" + s0wt,
@@ -1127,7 +1084,7 @@ def _extract_shared_features(ctx, state):
         "s1wc+s0wc=" + s1wc + "+" + s0wc,
         "s1amb+s0amb=" + s1amb + "+" + s0amb,
 
-        # Other pairs
+        # other pairs
         "s1t+n0t=" + s1t + "+" + n0t,
         "s1u+n0u=" + s1u + "+" + n0u,
         "s1w+n0w=" + s1w + "+" + n0w,
@@ -1139,7 +1096,7 @@ def _extract_shared_features(ctx, state):
         "n0wt+n1t=" + n0wt + "+" + n1t,
         "n0t+n1wt=" + n0t + "+" + n1wt,
 
-        # Three-word combinations
+        # three-word combinations
         "s1t+s0t+n0t=" + s1t + "+" + s0t + "+" + n0t,
         "s1bt+s0bt+n0bt=" + s1bt + "+" + s0bt + "+" + n0bt,
         "s1cg+s0cg+n0cg=" + s1cg + "+" + s0cg + "+" + n0cg,
@@ -1164,7 +1121,7 @@ def _extract_shared_features(ctx, state):
         "n0t+n1t+n2t=" + n0t + "+" + n1t + "+" + n2t,
         "s1t+s0t+n0t+n1t=" + s1t + "+" + s0t + "+" + n0t + "+" + n1t,
 
-        # Distance & In-Between Structural Features
+        # distance and words in between
         "s0w+d=" + s0w + "+" + distance,
         "s0t+d=" + s0t + "+" + distance,
         "n0w+d=" + n0w + "+" + distance,
@@ -1184,7 +1141,7 @@ def _extract_shared_features(ctx, state):
         "btw_s1s0_cg=" + s1cg + "+" + s0cg + "+" + between_s1_s0,
         "btw_s1s0_u=" + s1u + "+" + s0u + "+" + between_s1_s0,
 
-        # Children of s0, n0, and s1 (2nd-order siblings & grandchildren)
+        # children of s0, n0, and s1
         "s0_lc1_t=" + t(s0_lc1), "s0_lc1_l=" + lab(s0_lc1), "s0_lc1_w=" + w(s0_lc1),
         "s0_rc1_t=" + t(s0_rc1), "s0_rc1_l=" + lab(s0_rc1), "s0_rc1_w=" + w(s0_rc1),
         "n0_lc1_t=" + t(n0_lc1), "n0_lc1_l=" + lab(n0_lc1), "n0_lc1_w=" + w(n0_lc1),
@@ -1193,7 +1150,7 @@ def _extract_shared_features(ctx, state):
         "s0_lc2_l=" + lab(s0_lc2), "s0_rc2_l=" + lab(s0_rc2),
         "n0_lc2_l=" + lab(n0_lc2), "s1_rc2_l=" + lab(s1_rc2), "s1_lc2_l=" + lab(s1_lc2),
 
-        # Grandchild features (3rd-order)
+        # grandchild labels
         "s0_lc1_lc1_l=" + lab(s0_lc1_lc1) + "+" + s0t,
         "n0_lc1_lc1_l=" + lab(n0_lc1_lc1) + "+" + n0t,
         "s1_rc1_rc1_l=" + lab(s1_rc1_rc1) + "+" + s1t,
@@ -1211,13 +1168,13 @@ def _extract_shared_features(ctx, state):
         "s1t+s0t+s0_lc1_l=" + s1t + "+" + s0t + "+" + lab(s0_lc1),
         "s1t+s0t+s0_rc1_l=" + s1t + "+" + s0t + "+" + lab(s0_rc1),
 
-        # Coordination (conj / cc) symmetry features
+        # coordination features (conj / cc)
         "coord_s1_s0=" + s1cg + "+" + lab(s0_lc1) + "+" + w(s0_lc1) + "+" + s0cg,
         "coord_s1_s0_u=" + s1u + "+" + lab(s0_lc1) + "+" + w(s0_lc1) + "+" + s0u,
         "coord_s0_n0=" + s0cg + "+" + lab(n0_lc1) + "+" + w(n0_lc1) + "+" + n0cg,
         "coord_s0_n0_u=" + s0u + "+" + lab(n0_lc1) + "+" + w(n0_lc1) + "+" + n0u,
 
-        # Valency & Child Label-Set Features
+        # child counts and child label sets
         "s0w+n_left=" + s0w + "+" + s0_n_left,
         "s0t+n_left=" + s0t + "+" + s0_n_left,
         "s0w+n_right=" + s0w + "+" + s0_n_right,
@@ -1239,7 +1196,7 @@ def _extract_shared_features(ctx, state):
         "s1_subj+s0t=" + s1_subj + "+" + s1t + "+" + s0t,
         "n0_subj+s0t=" + n0_subj + "+" + n0t + "+" + s0t,
 
-        # Lexicalized Preposition (case), Subordinator (mark), and Passive Aux
+        # preposition (case), mark, and aux words
         "s0_case=" + s0_case + "+" + s0t,
         "s1w+s0_case=" + s1w + "+" + s0_case + "+" + s0cg,
         "s1st+s0_case=" + s1st + "+" + s0_case + "+" + s0cg,
@@ -1248,7 +1205,7 @@ def _extract_shared_features(ctx, state):
         "s1t+s0_case+s0w=" + s1t + "+" + s0_case + "+" + s0w,
         "n0w+s0_case=" + n0w + "+" + s0_case + "+" + s0cg,
         "n0st+s0_case=" + n0st + "+" + s0_case + "+" + s0cg,
-        "n0u+s0_case=" + n0u + "+" + s0_case + "+" + s0u,
+        "n0u+s0_case=" + n0u + "+" + s0_case + "+" + n0u,
         "n0t+s0_case=" + n0t + "+" + s0_case + "+" + s0t,
         "s0w+n0_case=" + s0w + "+" + n0_case + "+" + n0cg,
         "s0st+n0_case=" + s0st + "+" + n0_case + "+" + n0cg,
@@ -1262,14 +1219,14 @@ def _extract_shared_features(ctx, state):
         "s1st+s0_mark=" + s1st + "+" + s0_mark + "+" + s0cg,
         "n0t+s0_mark=" + n0t + "+" + s0_mark + "+" + s0t,
 
-        # Word endings
+        # word suffixes
         "s0suffix=" + ("<NONE>" if s0 == NONE else suf3[s0]),
         "n0suffix=" + ("<NONE>" if n0 == NONE else suf3[n0]),
         "s1suffix=" + ("<NONE>" if s1 == NONE else suf3[s1]),
         "s0suf+n0suf=" + ("<NONE>" if s0 == NONE else suf3[s0]) + "+" + ("<NONE>" if n0 == NONE else suf3[n0]),
         "s1suf+s0suf=" + ("<NONE>" if s1 == NONE else suf3[s1]) + "+" + ("<NONE>" if s0 == NONE else suf3[s0]),
 
-        # Surface sentence neighbors
+        # neighboring words in the sentence
         "s0t+s0+1t+n0t=" + s0t + "+" + t(s0_after) + "+" + n0t,
         "s0-1t+s0t+n0t=" + t(s0_before) + "+" + s0t + "+" + n0t,
         "s0t+n0-1t+n0t=" + s0t + "+" + t(n0_before) + "+" + n0t,
@@ -1281,7 +1238,7 @@ def _extract_shared_features(ctx, state):
         "s0w+s0+1w=" + s0w + "+" + w(s0_after),
         "n0-1w+n0w=" + w(n0_before) + "+" + n0w,
 
-        # Direction, Supertag Agreement & Buffer Lookahead
+        # directions, supertags, and lookahead
         "dirs=" + s1d + "+" + s0d + "+" + n0d,
         "s0sup=" + s0_st,
         "n0sup=" + n0_st,
@@ -1296,7 +1253,7 @@ def _extract_shared_features(ctx, state):
         "look_np=" + s0t + "+" + n0t + "+" + np_end_t + "+" + np_end_dist,
     ]
 
-    # Global Graph-Based MST Guide Features (Nivre & McDonald 2008)
+    # mst guide features
     if ctx.mst_h1 is not None:
         mst_h1 = ctx.mst_h1
         mst_h2 = ctx.mst_h2
@@ -1335,12 +1292,10 @@ def _extract_shared_features(ctx, state):
     return f
 
 
-# =====================================================================
-# 5. Arc-Hybrid, Arc-Eager & Arc-Standard Transition Parsers
-# =====================================================================
+# arc-hybrid, arc-eager, and arc-standard transition parsers
 
 class Parser:
-    """Arc-Hybrid Transition Parser (bottom-up right attachments)."""
+    # arc-hybrid transition parser
 
     def __init__(self, label_names, lexicon=None, n_rows=2 ** 21):
         self.label_names = label_names
@@ -1364,7 +1319,7 @@ class Parser:
         return RIGHT, self.label_names[class_number - 1 - self.n_labels]
 
     def get_features(self, ctx, state):
-        return _extract_shared_features(ctx, state)
+        return get_parser_features(ctx, state)
 
     def allowed_scores(self, scores, state):
         scores = scores.copy()
@@ -1468,14 +1423,14 @@ class Parser:
         self,
         sentences,
         tags_list,
-        random_generator,
+        rng,
         supertags_list=None,
         mst_list=None,
         upos_list=None,
         epoch=0,
     ):
         order = list(range(len(sentences)))
-        random_generator.shuffle(order)
+        rng.shuffle(order)
         explore_prob = 0.50 if epoch == 0 else 0.90
         for k in order:
             sentence = sentences[k]
@@ -1491,15 +1446,12 @@ class Parser:
                 minfo,
                 utags,
                 explore_prob=explore_prob,
-                rng=random_generator,
+                rng=rng,
             )
 
 
 class ArcEagerState(ParserState):
-    """
-    Arc-Eager state (Nivre 2003; Goldberg & Nivre 2012).
-    ROOT (0) starts at the bottom of the stack; buffer runs 1..n.
-    """
+    # arc-eager state: ROOT (0) starts on stack, buffer runs 1..n
 
     def __init__(self, n_words, words=None, is_punct=None):
         super().__init__(n_words, words, is_punct)
@@ -1574,7 +1526,7 @@ class ArcEagerState(ParserState):
 
 
 def eager_move_costs(state, gold_heads, gold_children):
-    """Exact dynamic oracle for Arc-Eager (Goldberg & Nivre 2012)."""
+    # dynamic oracle costs for arc-eager
     s0 = state.stack_word(0)
     b0 = state.buffer_word(0)
     stack_set = set(state.stack)
@@ -1620,10 +1572,7 @@ def eager_move_costs(state, gold_heads, gold_children):
 
 
 class ArcEagerParser:
-    """
-    Arc-Eager Transition Parser (top-down right attachments).
-    Exposes parent & already-assigned label features for `s0` and `s1`.
-    """
+    # arc-eager transition parser
 
     def __init__(self, label_names, lexicon=None, n_rows=2 ** 21):
         self.label_names = label_names
@@ -1651,7 +1600,7 @@ class ArcEagerParser:
         return RIGHT, self.label_names[class_number - 2 - self.n_labels]
 
     def get_features(self, ctx, state):
-        f = _extract_shared_features(ctx, state)
+        f = get_parser_features(ctx, state)
         s0 = state.stack_word(0)
         s1 = state.stack_word(1)
         n0 = state.buffer_word(0)
@@ -1804,14 +1753,14 @@ class ArcEagerParser:
         self,
         sentences,
         tags_list,
-        random_generator,
+        rng,
         supertags_list=None,
         mst_list=None,
         upos_list=None,
         epoch=0,
     ):
         order = list(range(len(sentences)))
-        random_generator.shuffle(order)
+        rng.shuffle(order)
         explore_prob = 0.50 if epoch == 0 else 0.90
         for k in order:
             sentence = sentences[k]
@@ -1827,19 +1776,12 @@ class ArcEagerParser:
                 minfo,
                 utags,
                 explore_prob=explore_prob,
-                rng=random_generator,
+                rng=rng,
             )
 
 
 class ArcStandardState(ParserState):
-    """
-    Arc-Standard state (Nivre 2004).
-    ROOT (0) starts at the bottom of the stack; buffer runs 1..n.
-    Moves:
-      SHIFT        : push b0 onto stack
-      LEFT(label)  : attach s0 -> s1 (head=s0, dep=s1), pop s1
-      RIGHT(label) : attach s1 -> s0 (head=s1, dep=s0), pop s0
-    """
+    # arc-standard state: ROOT (0) starts on stack, left attaches s0->s1, right attaches s1->s0
 
     def __init__(self, n_words, words=None, is_punct=None):
         super().__init__(n_words, words, is_punct)
@@ -1900,7 +1842,7 @@ class ArcStandardState(ParserState):
 
 
 def standard_move_costs(state, gold_heads, gold_children):
-    """Oracle for Arc-Standard (Nivre 2004)."""
+    # dynamic oracle costs for arc-standard
     s0 = state.stack_word(0)
     s1 = state.stack_word(1)
     stack_set = set(state.stack)
@@ -1939,13 +1881,10 @@ def standard_move_costs(state, gold_heads, gold_children):
 
 
 class ArcStandardParser(Parser):
-    """
-    Arc-Standard Transition Parser (bottom-up stack-stack s1/s0 attachments
-    with buffer lookahead n0).
-    """
+    # arc-standard transition parser
 
     def get_features(self, ctx, state):
-        f = _extract_shared_features(ctx, state)
+        f = get_parser_features(ctx, state)
         s0 = state.stack_word(0)
         s1 = state.stack_word(1)
         n0 = state.buffer_word(0)
@@ -2060,13 +1999,10 @@ class ArcStandardParser(Parser):
         self.model.next_step()
 
 
-# --- Full-Tree Dependency Label Classifier ---
+# full-tree label classifier
 
 class FullTreeLabeler:
-    """
-    Predicts/refines the dependency relation `label[m]` for each edge (h -> m)
-    given the complete dependency tree `heads[1..n]` and Induced POS `upos[1..n]`.
-    """
+    # predicts dependency label for each edge using the full tree structure
 
     def __init__(self, label_names, lexicon=None, n_rows=2 ** 20):
         self.label_names = label_names
@@ -2210,7 +2146,7 @@ class FullTreeLabeler:
         lsib_u = "<NONE>" if lsib < 0 else ctx.upos[lsib]
         lsib_w = "<NONE>" if lsib < 0 else ctx.words[lsib]
 
-        # Core-argument uniqueness on head h strictly excluding m itself
+        # check if head already has another subject or object child
         other_left_subj = any(
             c != m and c < h and ctx.base_tags[c] in ("nsubj", "csubj")
             for c in sibs
@@ -2247,7 +2183,7 @@ class FullTreeLabeler:
         m_punct_l = mw_l1 if mw_l1 in (",", ":", ";", "(", ")", '"', "--", "-") else "NO"
         m_punct_r = mw_r1 if mw_r1 in (",", ":", ";", "(", ")", '"', "--", "-") else "NO"
 
-        # Leftmost dependent of m and word immediately after h (for acl:relcl vs acl vs advcl vs ccomp)
+        # leftmost child of m and word right after h (helps for acl:relcl / acl / advcl / ccomp)
         m_lc1 = children[m][0] if (children[m] and children[m][0] < m) else -1
         m_lc1_w = ctx.words[m_lc1] if m_lc1 > 0 else "<NONE>"
         m_lc1_bt = ctx.base_tags[m_lc1] if m_lc1 > 0 else "<NONE>"
@@ -2291,25 +2227,25 @@ class FullTreeLabeler:
             "mu+hu+gu=" + mu + "+" + hu + "+" + gu,
             "mcg+hcg+gcg=" + mcg + "+" + hcg + "+" + gcg,
 
-            # Full-tree PP (obl vs nmod vs nmod:poss) disambiguation
+            # obl vs nmod vs nmod:poss features
             "pp_full=" + m_case + "+" + hu + "+" + hbt + "+" + h_is_pred + "+" + h_is_nom + "+" + dr,
             "pp_lex=" + hst + "+" + m_case + "+" + mu + "+" + hu,
             "pp_head_cop=" + m_case + "+" + str(has_cop[h]) + "+" + hu + "+" + hcg,
             "pp_head_case=" + m_case + "+" + h_case + "+" + hu,
 
-            # Full-tree clausal (ccomp vs xcomp vs advcl vs acl vs acl:relcl) disambiguation
+            # clause label features (ccomp, xcomp, advcl, acl, acl:relcl)
             "cl_full=" + m_is_clause + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hu + "+" + hcg + "+" + dr,
             "cl_lex=" + hst + "+" + m_mark + "+" + str(has_subj[m]) + "+" + str(other_obj_left or other_obj_right) + "+" + str(has_expl[h]),
             "cl_aux=" + m_aux + "+" + m_mark + "+" + str(has_subj[m]) + "+" + hu,
             "cl_rel=" + hu + "+" + w_after_h + "+" + bt_after_h + "+" + str(has_subj[m]) + "+" + dr,
             "cl_lc1=" + hu + "+" + m_lc1_w + "+" + m_lc1_bt + "+" + str(has_subj[m]) + "+" + dr,
 
-            # Full-tree passive & subject/object/iobj/obl:unmarked uniqueness disambiguation
+            # passive and subject/object features
             "pass_full=" + str(has_pass[h]) + "+" + h_aux + "+" + mu + "+" + mbt + "+" + dr + "+" + m_case,
             "obj_full=" + str(other_obj_left) + "+" + str(other_obj_right) + "+" + str(has_cop[h]) + "+" + mu + "+" + mbt + "+" + dr,
             "subj_uniq=" + str(other_left_subj) + "+" + str(has_expl[h]) + "+" + str(has_cop[h]) + "+" + mu + "+" + mbt + "+" + dr,
 
-            # Pre-nominal (compound vs amod vs flat vs det vs nmod:poss) disambiguation
+            # noun modifier features (compound, amod, flat, det, nmod:poss)
             "nom_full=" + mu + "+" + hu + "+" + msig + "+" + hsig + "+" + dr + "+" + dist + "+" + str(has_det[m]),
             "nom_adv=" + str(has_advmod[m]) + "+" + mu + "+" + hu + "+" + msig + "+" + dr,
             "nom_sib=" + lsib_u + "+" + mu + "+" + mt + "+" + rsib_t + "+" + hu,
@@ -2317,12 +2253,12 @@ class FullTreeLabeler:
             "upos_neigh=" + mu_l1 + "+" + mu + "+" + mu_r1 + "+" + hu + "+" + dr,
             "mw_neigh=" + mw_l1 + "+" + mw + "+" + mw_r1 + "+" + dr,
 
-            # Coordination (cc child on m -> conj) & punctuation enclosure
+            # coordination and surrounding punctuation
             "cc_full=" + m_cc + "+" + mu + "+" + hu + "+" + dr,
             "punct_enc=" + m_punct_l + "+" + m_punct_r + "+" + mu + "+" + hu + "+" + dr,
             "val_lbl=" + m_nch + "+" + h_nch + "+" + mu + "+" + hu + "+" + dr,
 
-            # Children & sibling structure
+            # children and sibling info
             "m_ch_cgs=" + child_cg_sig[m] + "+" + mu + "+" + hu,
             "h_ch_cgs=" + child_cg_sig[h] + "+" + mu + "+" + dr,
             "lsib=" + lsib_t + "+" + lsib_w + "+" + mu + "+" + mbt,
@@ -2380,11 +2316,7 @@ class FullTreeLabeler:
         self.model.average_weights()
 
     def score_sentence_labels(self, words, tags, supertags, heads, upos=None, extra_models=None):
-        """
-        Return a list of length n + 1 where entry `m` (for m >= 1) is a dict
-        mapping `label_name -> score` from the full-tree labeler (optionally
-        averaged with `extra_models`).
-        """
+        # get label scores for each word in the sentence (averaged across extra seeds if given)
         tree_ctx = self._prepare_tree_context(words, tags, supertags, heads, upos)
         n = len(words) - 1
         out = [None] * (n + 1)
@@ -2406,7 +2338,7 @@ class FullTreeLabeler:
         return out
 
 
-# --- Helpers for right-to-left sentence flipping ---
+# helpers for reversing sentences for right-to-left parsers
 
 def flip_position(i, n):
     if i <= 0:

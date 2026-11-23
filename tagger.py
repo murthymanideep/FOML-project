@@ -1,9 +1,4 @@
-"""
-Sequence taggers for predicting each word's:
-  - UPOS word class (induced from training dependency trees)
-  - Directional syntactic role tag (e.g. "nsubj>", "obl<", "root")
-  - Relative head-offset supertag (e.g. "+1:OBJ", "-2:CLAUSE")
-"""
+# sequence taggers for upos tags, directional role tags, and head-offset supertags
 
 import random
 
@@ -17,10 +12,10 @@ from data_utils import (
     tag_direction,
     head_offset_bucket,
     find_punct_forms,
-    find_standalone_nominals,
-    find_possessive_markers,
+    get_standalone_words,
+    get_possessive_words,
     build_lexicon,
-    lookup_word_priors,
+    get_word_info,
 )
 from perceptron import AveragedPerceptron
 
@@ -30,32 +25,29 @@ END = "<END>"
 
 
 def make_upos_targets(sentences):
-    """
-    Induce a word class for every training word (17 classes such as NOUN, VERB,
-    ADP, PUNCT) directly from the training trees.
-    """
-    nonclause_counts = {}
-    clausal_roles = {"root", "conj", "ccomp", "xcomp", "advcl", "acl", "parataxis", "csubj"}
+    # build 18 word classes (NOUN, VERB, ADP, etc) from train trees
+    other_counts = {}
+    clause_labels = {"root", "conj", "ccomp", "xcomp", "advcl", "acl", "parataxis", "csubj"}
     for s in sentences:
         words = s["words"]
         labels = s["labels"]
         for i in range(1, len(words)):
             b = base_label(labels[i])
-            if b not in clausal_roles:
+            if b not in clause_labels:
                 nw = normalize_word(words[i])
-                cmap = nonclause_counts.get(nw)
+                cmap = other_counts.get(nw)
                 if cmap is None:
                     cmap = {}
-                    nonclause_counts[nw] = cmap
+                    other_counts[nw] = cmap
                 cmap[b] = cmap.get(b, 0) + 1
 
-    nonclause_dom = {}
-    for nw, cmap in nonclause_counts.items():
-        nonclause_dom[nw] = max(cmap.items(), key=lambda kv: kv[1])[0]
+    main_label = {}
+    for nw, cmap in other_counts.items():
+        main_label[nw] = max(cmap.items(), key=lambda kv: kv[1])[0]
 
     punct_forms = find_punct_forms(sentences)
-    standalone_nominals = find_standalone_nominals(sentences)
-    possessive_markers = find_possessive_markers(sentences)
+    standalone_words = get_standalone_words(sentences)
+    poss_words = get_possessive_words(sentences)
 
     upos_sentences = []
     for s in sentences:
@@ -86,7 +78,7 @@ def make_upos_targets(sentences):
             has_amod = any(base_label(labels[c]) == "amod" for c in c_list)
             has_obj = any(base_label(labels[c]) in ("obj", "iobj") for c in c_list)
             has_flat = any(base_label(labels[c]) == "flat" for c in c_list)
-            is_capitalised = sig.startswith(("MID_CAP", "ALL_CAP"))
+            is_cap = sig.startswith(("MID_CAP", "ALL_CAP"))
 
             if b_lab == "punct" or w in punct_forms:
                 u = "PUNCT"
@@ -105,7 +97,7 @@ def make_upos_targets(sentences):
             elif b_lab == "expl":
                 u = "PRON"
             elif b_lab == "case":
-                u = "PART" if nw in possessive_markers else "ADP"
+                u = "PART" if nw in poss_words else "ADP"
             elif b_lab == "mark":
                 u = "SCONJ"
             elif b_lab == "advmod":
@@ -114,34 +106,34 @@ def make_upos_targets(sentences):
                 u = "ADJ"
             elif b_lab == "flat":
                 u = "PROPN"
-            elif b_lab not in clausal_roles and not has_aux and not has_obj:
-                if nw in standalone_nominals:
+            elif b_lab not in clause_labels and not has_aux and not has_obj:
+                if nw in standalone_words:
                     u = "PRON"
-                elif has_flat or is_capitalised:
+                elif has_flat or is_cap:
                     u = "PROPN"
-                elif nonclause_dom.get(nw) == "amod" and not has_det:
+                elif main_label.get(nw) == "amod" and not has_det:
                     u = "ADJ"
                 else:
                     u = "NOUN"
             else:
-                nc_dom = nonclause_dom.get(nw)
+                nc_dom = main_label.get(nw)
                 if has_cop:
                     if has_det or has_amod or nc_dom in ("nsubj", "obj", "obl", "nmod", "compound"):
-                        if nw in standalone_nominals:
+                        if nw in standalone_words:
                             u = "PRON"
-                        elif has_flat or is_capitalised:
+                        elif has_flat or is_cap:
                             u = "PROPN"
                         else:
                             u = "NOUN"
                     else:
                         u = "ADJ"
                 elif not has_aux and not has_obj and (has_det or has_amod or has_flat):
-                    u = "PROPN" if (has_flat or is_capitalised) else "NOUN"
+                    u = "PROPN" if (has_flat or is_cap) else "NOUN"
                 elif not has_aux and not has_obj and b_lab == "conj":
                     if nc_dom == "amod":
                         u = "ADJ"
-                    elif nc_dom in ("nsubj", "obj", "obl", "nmod", "compound") or is_capitalised:
-                        u = "PROPN" if is_capitalised else "NOUN"
+                    elif nc_dom in ("nsubj", "obj", "obl", "nmod", "compound") or is_cap:
+                        u = "PROPN" if is_cap else "NOUN"
                     else:
                         u = "VERB"
                 else:
@@ -163,7 +155,7 @@ def make_upos_targets(sentences):
 
 
 def make_word_tag(sentence, index):
-    """Build the directional tag of word `index`, for example "nsubj>" or "root"."""
+    # directional tag like nsubj> or obl< or root
     head = sentence["heads"][index]
     label = sentence["labels"][index]
     if head == 0:
@@ -174,7 +166,6 @@ def make_word_tag(sentence, index):
 
 
 def make_tag_targets(sentences):
-    """Return a copy of the sentences where "labels" are the directional tags."""
     tagged_sentences = []
     for sentence in sentences:
         tags = [sentence["words"][0]]
@@ -190,7 +181,7 @@ def make_tag_targets(sentences):
 
 
 def make_supertag_targets(sentences):
-    """Return a copy of sentences where "labels" are head-offset + coarse group supertags."""
+    # supertag format: distance_bucket:head_group (like +1:OBJ)
     super_sentences = []
     for sentence in sentences:
         words = sentence["words"]
@@ -224,8 +215,8 @@ def tag_accuracy(tag_sentences, predicted_tags):
     return 100.0 * correct / total
 
 
-def _prepare_global_tag_context(first_tags, backward_tags=None, upos_tags=None):
-    """Precompute sentence-level lookahead offsets to nearest root, clause/verb, and nominal."""
+def get_tag_context(first_tags, backward_tags=None, upos_tags=None):
+    # find distances to nearest root, clause/verb, and noun in the sentence
     n = len(first_tags) - 1
     c_tags = [coarse_group(t) for t in first_tags]
 
@@ -281,8 +272,8 @@ def _prepare_global_tag_context(first_tags, backward_tags=None, upos_tags=None):
     return (off_root, off_l_cl, off_r_cl, off_l_nom, off_r_nom, str(min(len(roots), 3)))
 
 
-def _prepare_upos_sentence_context(upos_tags):
-    """Precompute global verb/copula/noun lookahead from `upos_tags`."""
+def get_upos_context(upos_tags):
+    # find distances to nearest verb and noun using upos tags
     n = len(upos_tags) - 1
     left_v = [0] * (n + 1)
     right_v = [0] * (n + 1)
@@ -341,7 +332,7 @@ class Tagger:
         sigs = [word_signature(words[i], i) for i in range(n + 1)]
         if self.lexicon is not None:
             priors = [
-                lookup_word_priors(self.lexicon, words[i], normal_words[i], i)
+                get_word_info(self.lexicon, words[i], normal_words[i], i)
                 for i in range(n + 1)
             ]
         else:
@@ -439,7 +430,7 @@ class Tagger:
             "first_word=" + str(i == 1),
             "last_word=" + str(i == n),
 
-            # Window words, stems, shapes & signatures
+            # neighbor words, stems, shapes and signatures
             "w-1=" + w_m1,
             "w-2=" + w_m2,
             "w-3=" + w_m3,
@@ -455,7 +446,7 @@ class Tagger:
             "sh-1+sh0+sh+1=" + sh_m1 + "+" + shape + "+" + sh_p1,
             "sig-1+sig0+sig+1=" + sig_m1 + "+" + sig0 + "+" + sig_p1,
 
-            # Word n-grams
+            # word n-grams
             "w-1+w=" + w_m1 + "+" + normal,
             "w+w+1=" + normal + "+" + w_p1,
             "w-1+w+1=" + w_m1 + "+" + w_p1,
@@ -466,7 +457,7 @@ class Tagger:
             "w+w+1+w+2=" + normal + "+" + w_p1 + "+" + w_p2,
             "w+1+w+2+w+3=" + w_p1 + "+" + w_p2 + "+" + w_p3,
 
-            # History transitions
+            # previous predicted tags
             "t-1=" + previous_tag,
             "t-2=" + previous_tag_2,
             "t-2+t-1=" + previous_tag_2 + "+" + previous_tag,
@@ -479,7 +470,7 @@ class Tagger:
             "cg-1+w=" + prev_cg + "+" + normal,
             "cg-2+cg-1+sig=" + prev2_cg + "+" + prev_cg + "+" + sig0,
 
-            # Empirical lexicon prior features
+            # lexicon stats features
             "dom0=" + dom0,
             "amb0=" + amb0,
             "crs0=" + crs0,
@@ -516,7 +507,7 @@ class Tagger:
             "pos=" + str(min(i, 5)) + "+" + str(min(n - i, 5)),
         ]
 
-        # Induced POS (`upos`) features
+        # upos features
         if upos_tags is not None:
             u0 = upos_tags[i]
             u_l1 = upos_tags[i - 1] if i - 1 >= 1 else START
@@ -636,14 +627,14 @@ class Tagger:
         backward_tags=None,
         upos_tags=None,
     ):
-        """Tag one sentence (left-to-right or right-to-left)."""
+        # tag one sentence left-to-right or right-to-left
         normal_words, stems, shapes, sigs, priors = self._prepare_sentence(words)
         global_ctx = (
-            _prepare_global_tag_context(first_tags, backward_tags, upos_tags)
+            get_tag_context(first_tags, backward_tags, upos_tags)
             if first_tags is not None
             else None
         )
-        upos_ctx = _prepare_upos_sentence_context(upos_tags) if upos_tags is not None else None
+        upos_ctx = get_upos_context(upos_tags) if upos_tags is not None else None
         n = len(words) - 1
         tags = [None] * (n + 1)
         tags[0] = words[0]
@@ -707,11 +698,10 @@ class Tagger:
         backward_tags_list=None,
         upos_tags_list=None,
     ):
-        """Train on sentences where sentence['labels'] are the target tags."""
-        random_generator = random.Random(seed)
+        rng = random.Random(seed)
         order = list(range(len(sentences)))
         for _ in range(epochs):
-            random_generator.shuffle(order)
+            rng.shuffle(order)
             for k in order:
                 sentence = sentences[k]
                 first_tags = first_tags_list[k] if first_tags_list is not None else None
@@ -721,7 +711,7 @@ class Tagger:
                     sentence["words"],
                     sentence["labels"],
                     first_tags,
-                    random_generator,
+                    rng,
                     bwd_tags,
                     utags,
                 )
@@ -753,7 +743,7 @@ def train_tagger(
     return tagger
 
 
-def jackknife_tags(
+def cv_tags(
     sentences,
     tag_names,
     epochs,
@@ -763,7 +753,7 @@ def jackknife_tags(
     backward_tags_list=None,
     upos_tags_list=None,
 ):
-    """5-fold out-of-fold tagging on training sentences with fold-specific lexicons."""
+    # 5-fold out-of-fold tagging on train data so next stages dont overfit
     all_tags = [None] * len(sentences)
 
     for fold in range(n_folds):
